@@ -1527,22 +1527,34 @@ impl Exporter<'_> {
             }
             return;
         }
-        // Placed SVGs go in as vectors too.
+        // Placed SVGs and WMFs go in as vectors too.
         if let Some(asset) = self.doc.assets.get(&g.asset)
-            && designcraft_images::is_svg(&asset.data)
+            && (designcraft_images::is_svg(&asset.data) || designcraft_images::is_wmf(&asset.data))
         {
             let Some(size) = Size::from_wh(g.size.0.max(1e-3) as f32, g.size.1.max(1e-3) as f32) else { return };
-            let tree = self.svgs.entry(g.asset).or_insert_with(|| designcraft_images::svg_tree(&asset.data).map(Arc::new)).clone();
+            let wmf = designcraft_images::is_wmf(&asset.data);
+            let tree = self
+                .svgs
+                .entry(g.asset)
+                .or_insert_with(|| {
+                    let parsed = if wmf {
+                        designcraft_images::wmf_svg(&asset.data).and_then(|svg| designcraft_images::svg_tree(svg.as_bytes()))
+                    } else {
+                        designcraft_images::svg_tree(&asset.data)
+                    };
+                    parsed.map(Arc::new)
+                })
+                .clone();
             match tree {
                 Some(tree) => {
                     use krilla_svg::SurfaceExt;
                     s.push_transform(&tf(g.xf));
                     if s.draw_svg(&tree, size, krilla_svg::SvgSettings::default()).is_none() {
-                        self.warn(format!("{}: parts of the placed SVG could not be drawn", asset.name));
+                        self.warn(format!("{}: parts of the placed {} could not be drawn", asset.name, if wmf { "WMF" } else { "SVG" }));
                     }
                     s.pop();
                 }
-                None => self.warn(format!("{}: can't read the placed SVG", asset.name)),
+                None => self.warn(format!("{}: can't read the placed {}", asset.name, if wmf { "WMF" } else { "SVG" })),
             }
             return;
         }
@@ -2191,6 +2203,84 @@ mod image_content_cache_tests {
         drop(d);
         assert!(payload.upgrade().is_none(), "no converted image or encoded key outlives this exporter");
         assert!(duplicate.upgrade().is_none());
+    }
+
+    #[test]
+    fn a_placed_wmf_is_drawn_as_vector_svg() {
+        fn record(function: u16, params: &[u8]) -> Vec<u8> {
+            let words = (6 + params.len()).div_ceil(2);
+            let mut r = Vec::new();
+            r.extend(u32::try_from(words).unwrap().to_le_bytes());
+            r.extend(function.to_le_bytes());
+            r.extend(params);
+            if params.len() % 2 == 1 {
+                r.push(0);
+            }
+            r
+        }
+        // A placeable 100×100 WMF at 96 units per inch with a red square.
+        let mut body = Vec::new();
+        // META_CREATEBRUSHINDIRECT: solid, red (COLORREF 0x000000FF), no hatch.
+        let mut brush = Vec::new();
+        brush.extend(0u16.to_le_bytes());
+        brush.extend(0x0000_00FFu32.to_le_bytes());
+        brush.extend(0u16.to_le_bytes());
+        body.extend(record(0x02FC, &brush));
+        // META_SELECTOBJECT: brush 0.
+        body.extend(record(0x012D, &0u16.to_le_bytes()));
+        // META_POLYGON: three points.
+        let mut polygon = Vec::new();
+        polygon.extend(3u16.to_le_bytes());
+        for (x, y) in [(10i16, 10i16), (90, 10), (50, 90)] {
+            polygon.extend(x.to_le_bytes());
+            polygon.extend(y.to_le_bytes());
+        }
+        body.extend(record(0x0324, &polygon));
+        body.extend(record(0, &[]));
+        let mut wmf = Vec::new();
+        wmf.extend(0x9AC6_CDD7u32.to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        for v in [0i16, 0, 100, 100] {
+            wmf.extend(v.to_le_bytes());
+        }
+        wmf.extend(96u16.to_le_bytes());
+        wmf.extend(0u32.to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        let words = (22 + 18 + body.len()) / 2;
+        wmf.extend(1u16.to_le_bytes());
+        wmf.extend(9u16.to_le_bytes());
+        wmf.extend(0x0300u16.to_le_bytes());
+        wmf.extend(u32::try_from(words).unwrap().to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        wmf.extend(0u32.to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        wmf.extend(body);
+
+        let mut d = Document::new(&Default::default());
+        let a = asset(&mut d, wmf, "art.wmf");
+        let cache = Cache::new();
+        let opts = PdfOptions::default();
+        let mut ex = exporter(&d, &cache, &opts);
+        let mut writer = Writer::new(Default::default(), Default::default());
+        let mut page = writer.document_mut().start_page_with(PageSettings::new(Size::from_wh(100.0, 100.0).unwrap()));
+        let mut surface = page.surface();
+        let graphic = designcraft_doc::Graphic {
+            asset: a,
+            size: (72.0, 72.0),
+            xf: Affine::IDENTITY,
+            clip: None,
+            auto_fit: Default::default(),
+            fit_align: 4,
+            crop: [0.0; 4],
+            wrap: Default::default(),
+            fill: Default::default(),
+        };
+        ex.graphic_unclipped(&mut surface, &graphic, None);
+        assert!(ex.warnings.is_empty(), "the WMF must draw, not warn: {:?}", ex.warnings);
+        assert!(matches!(ex.svgs.get(&a), Some(Some(_))), "cached as a parsed SVG vector");
+        surface.finish();
+        page.finish();
+        assert!(writer.finish().is_ok());
     }
 }
 

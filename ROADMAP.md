@@ -11,6 +11,15 @@
 
 DesignCraft aims at full Adobe InDesign parity — and to be better: faster, open (documented JSON format + IDML), scriptable by agents (MCP), and available on the web.
 
+- **2026-10-26** · WMF (Windows Metafile) artwork places as vector paths: GDI pens, brushes,
+  lines, polygons, rectangles, ellipses, round-rects and pixels are converted in-house to SVG
+  for screen, PDF and EPUB (PPTX rasterises it). The placeable header supplies the natural size
+  and the background is transparent. 1-bit PCX white is now transparent, matching InDesign's
+  bitmap images. Unsupported WMF content is refused with an alert instead of drawing blank.
+  No readiness percentage change.
+- **2026-10-25** · PCX (ZSoft Paintbrush) images place like the other rasters: 1-, 2-, 4- and
+  8-bit paletted, 24-bit RGB and 32-bit RGBA decode through `designcraft-images`, with header
+  sizes, PDF/EPUB export and the desktop and web place dialogs. No readiness percentage change.
 - **2026-10-23** · PDF layer choices now validate before editing all targets; rejected rewrites
   leave document/undo state intact. Null trailer entries remain unencrypted, and unsupported
   all-content crops retain the whole page rather than silently clipping hidden layers.

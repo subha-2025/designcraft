@@ -1069,6 +1069,7 @@ dependencies = [
  "chrono",
  "designcraft-color",
  "designcraft-doc",
+ "designcraft-images",
  "zip",
 ]
 

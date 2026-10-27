@@ -9,6 +9,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -663,7 +664,7 @@ struct StoryWriter<'a, 'f> {
     /// it, anchored objects are left out.
     img_src: Option<&'f dyn Fn(&str, &str, &[u8]) -> String>,
     /// Images, video and sound met so far, by package name.
-    images: BTreeMap<String, (&'a str, &'a [u8])>,
+    images: BTreeMap<String, (&'a str, Cow<'a, [u8]>)>,
     /// Asset names of the images written without alt text (decorative).
     no_alt: Vec<String>,
     /// Prefix of the `id`s the current story's headings get (`{prefix}-p{paragraph index}`, the
@@ -887,7 +888,7 @@ impl<'a, 'f> StoryWriter<'a, 'f> {
         // Video and sound: an HTML5 player (with the poster, when there is one).
         if let Some(kind) = designcraft_doc::media_kind(mime) {
             let name = asset_path("media", a, mime);
-            self.images.insert(name.clone(), (mime, a.data.as_slice()));
+            self.images.insert(name.clone(), (mime, Cow::Borrowed(a.data.as_slice())));
             let m = it.media.clone().unwrap_or_default();
             let mut attrs = String::new();
             for (on, attr) in [(m.controls, " controls=\"controls\""), (m.play_on_page_load, " autoplay=\"autoplay\""), (m.looping, " loop=\"loop\"")]
@@ -899,7 +900,7 @@ impl<'a, 'f> StoryWriter<'a, 'f> {
             if let Some(pa) = m.poster.and_then(|p| doc.assets.get(&p)) {
                 let poster_mime = safe_mime(&pa.mime);
                 let pn = asset_path("images", pa, poster_mime);
-                self.images.insert(pn.clone(), (poster_mime, pa.data.as_slice()));
+                self.images.insert(pn.clone(), (poster_mime, Cow::Borrowed(pa.data.as_slice())));
                 if kind == "video" {
                     attrs.push_str(&format!(" poster=\"{}\"", xml_attr(&img_src(&pn, poster_mime, &pa.data))));
                 }
@@ -907,14 +908,24 @@ impl<'a, 'f> StoryWriter<'a, 'f> {
             let markup = format!("<{kind} src=\"{}\"{attrs}>{}</{kind}>", xml_attr(&img_src(&name, mime, &a.data)), xml_text(&a.name));
             return Some((markup, true));
         }
+        // A WMF is a vector: replay it as SVG, which EPUB readers draw natively. Refusing one we
+        // can't draw keeps a broken image out of the book, as the screen also refuses it.
+        let mut mime = safe_mime(&a.mime);
+        let mut data = Cow::Borrowed(a.data.as_slice());
+        if designcraft_images::is_wmf(&a.data) {
+            let svg = designcraft_images::wmf_svg(&a.data)?;
+            mime = "image/svg+xml";
+            data = Cow::Owned(svg.into_bytes());
+        }
         let name = asset_path("images", a, mime);
-        self.images.insert(name.clone(), (mime, a.data.as_slice()));
+        let src = img_src(&name, mime, data.as_ref());
+        self.images.insert(name, (mime, data));
         // Alt text from Object Export Options; without one the image counts as decorative
         // (`alt=""`): a file name read aloud helps nobody.
         if it.alt_text.trim().is_empty() {
             self.no_alt.push(a.name.clone());
         }
-        Some((format!("<img src=\"{}\" alt=\"{}\"/>", xml_attr(&img_src(&name, mime, &a.data)), xml_attr(&it.alt_text)), false))
+        Some((format!("<img src=\"{}\" alt=\"{}\"/>", xml_attr(&src), xml_attr(&it.alt_text)), false))
     }
 
     /// The footnote whose reference is at byte `pos` of `st`: a note reference in `out`, the note
@@ -1279,6 +1290,9 @@ fn ext(mime: &str) -> &'static str {
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/pcx" => "pcx",
+        "image/x-wmf" => "wmf",
         "image/svg+xml" => "svg",
         "video/mp4" => "mp4",
         "video/quicktime" => "mov",
@@ -1297,7 +1311,7 @@ fn ext(mime: &str) -> &'static str {
 struct Body<'a> {
     html: String,
     /// Images, video and sound by package name: (media type, bytes).
-    images: BTreeMap<String, (&'a str, &'a [u8])>,
+    images: BTreeMap<String, (&'a str, Cow<'a, [u8]>)>,
     /// Table of contents: (element id, label, level).
     toc: Vec<(String, String, u8)>,
     /// Asset names of the images written without alt text.
@@ -1460,7 +1474,7 @@ pub fn export_epub(doc: &Document, opts: &EpubOptions) -> Result<Vec<u8>, EpubEr
     let css = stylesheet_with(doc, &opts.generic_families, &opts.fonts);
     let mut entries: Vec<(String, &[u8], bool)> = vec![("OEBPS/style.css".into(), css.as_bytes(), false)];
     entries.extend(chapters.iter().enumerate().map(|(k, c)| (format!("OEBPS/{}", chapter_file(k)), c.as_bytes(), false)));
-    entries.extend(images.iter().map(|(name, (_, data))| (format!("OEBPS/{name}"), *data, true)));
+    entries.extend(images.iter().map(|(name, (_, data))| (format!("OEBPS/{name}"), data.as_ref(), true)));
     entries.extend(opts.fonts.iter().enumerate().map(|(k, f)| (format!("OEBPS/{}", font_file(k, f).0), f.data.as_slice(), false)));
     let cover_xhtml = opts.cover.as_ref().map(|c| {
         format!(
@@ -1570,6 +1584,98 @@ mod tests {
         assert!(page.contains("alt=\"inline\"") && page.contains("alt=\"above\""), "{page}");
         // story_html on its own still leaves objects out.
         assert!(!story_html(&d, sid).contains("<img"));
+    }
+
+    /// A placed WMF is published as an SVG: EPUB readers can't draw WMF, and converting it to
+    /// SVG keeps the artwork vector (and its transparent background).
+    #[test]
+    fn a_placed_wmf_is_published_as_svg() {
+        fn record(function: u16, params: &[u8]) -> Vec<u8> {
+            let words = (6 + params.len()).div_ceil(2);
+            let mut r = Vec::new();
+            r.extend(u32::try_from(words).unwrap().to_le_bytes());
+            r.extend(function.to_le_bytes());
+            r.extend(params);
+            if params.len() % 2 == 1 {
+                r.push(0);
+            }
+            r
+        }
+        let mut brush = Vec::new();
+        brush.extend(0u16.to_le_bytes());
+        brush.extend(0x0000_00FFu32.to_le_bytes()); // red
+        brush.extend(0u16.to_le_bytes());
+        let mut polygon = Vec::new();
+        polygon.extend(3u16.to_le_bytes());
+        for (x, y) in [(10i16, 10i16), (90, 10), (50, 90)] {
+            polygon.extend(x.to_le_bytes());
+            polygon.extend(y.to_le_bytes());
+        }
+        let mut body = record(0x02FC, &brush) // META_CREATEBRUSHINDIRECT
+            .into_iter()
+            .chain(record(0x012D, &0u16.to_le_bytes())) // META_SELECTOBJECT
+            .chain(record(0x0324, &polygon)) // META_POLYGON
+            .chain(record(0, &[])) // META_EOF
+            .collect::<Vec<_>>();
+        let mut wmf = Vec::new();
+        wmf.extend(0x9AC6_CDD7u32.to_le_bytes()); // placeable key
+        wmf.extend(0u16.to_le_bytes());
+        for v in [0i16, 0, 96, 96] {
+            wmf.extend(v.to_le_bytes());
+        }
+        wmf.extend(96u16.to_le_bytes()); // units per inch
+        wmf.extend(0u32.to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        let words = (22 + 18 + body.len()) / 2;
+        wmf.extend(1u16.to_le_bytes());
+        wmf.extend(9u16.to_le_bytes());
+        wmf.extend(0x0300u16.to_le_bytes());
+        wmf.extend(u32::try_from(words).unwrap().to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        wmf.extend(0u32.to_le_bytes());
+        wmf.extend(0u16.to_le_bytes());
+        wmf.append(&mut body);
+
+        let mut d = Document::new(&NewDocument::default());
+        let lid = d.default_layer();
+        let aid = AssetId(d.alloc());
+        d.assets.insert(
+            aid,
+            Arc::new(Asset {
+                page: 0,
+                id: aid,
+                name: "art.wmf".into(),
+                mime: "image/x-wmf".into(),
+                data: Arc::new(wmf),
+                pixels: Some((72, 72)),
+                ..Default::default()
+            }),
+        );
+        let mut item = Item::new(ItemId(d.alloc()), lid, Shape::Rectangle, shapes::rectangle(Rect::new(36.0, 36.0, 108.0, 108.0)));
+        item.content = Content::Graphic(Graphic {
+            asset: aid,
+            size: (72.0, 72.0),
+            xf: Affine::IDENTITY,
+            auto_fit: Default::default(),
+            fit_align: 4,
+            crop: [0.0; 4],
+            clip: None,
+            wrap: Default::default(),
+            fill: Default::default(),
+        });
+        d.insert_item(SpreadRef::Doc(0), item, None).unwrap();
+
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(export_epub(&d, &EpubOptions::default()).unwrap())).unwrap();
+        let mut html = String::new();
+        z.by_name("OEBPS/content.xhtml").unwrap().read_to_string(&mut html).unwrap();
+        assert!(html.contains(&format!("<img src=\"images/art-{}.svg\"", aid.0)), "{html}");
+        let mut opf = String::new();
+        z.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains(&format!("href=\"images/art-{}.svg\" media-type=\"image/svg+xml\"", aid.0)), "{opf}");
+        let mut svg = String::new();
+        z.by_name(&format!("OEBPS/images/art-{}.svg", aid.0)).unwrap().read_to_string(&mut svg).unwrap();
+        assert!(svg.contains("<polygon"), "the WMF shapes survive as vectors: {svg}");
+        assert!(z.by_name(&format!("OEBPS/images/art-{}.wmf", aid.0)).is_err(), "raw WMF is not shipped");
     }
 
     #[test]
