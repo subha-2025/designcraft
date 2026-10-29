@@ -1422,7 +1422,8 @@ dependencies = [
  "chrono",
  "designcraft-color",
  "designcraft-doc",
- "zip 3.0.0",
+ "designcraft-images",
+ "zip",
 ]
 
 [[package]]

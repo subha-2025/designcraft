@@ -233,7 +233,7 @@ fn open_filters(purpose: &str) -> &'static [OpenFilter] {
         "library" => &[OpenFilter { name: "Object Library", extensions: &["dclib"] }],
         "relink" => &[OpenFilter {
             name: "Graphics",
-            extensions: &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "psd", "svg", "pdf", "ai", "eps"],
+            extensions: &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "pcx", "wmf", "psd", "svg", "pdf", "ai", "eps"],
         }],
         "dataMerge" => &[OpenFilter { name: "Data source (CSV, TSV, text, Excel)", extensions: &["csv", "tsv", "tab", "txt", "xlsx"] }],
         "place" => &[
@@ -248,6 +248,8 @@ fn open_filters(purpose: &str) -> &'static [OpenFilter] {
                     "tif",
                     "tiff",
                     "bmp",
+                    "pcx",
+                    "wmf",
                     "psd",
                     "svg",
                     "pdf",
@@ -272,7 +274,7 @@ fn open_filters(purpose: &str) -> &'static [OpenFilter] {
             },
             OpenFilter {
                 name: "Graphics",
-                extensions: &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "psd", "svg", "pdf", "ai", "eps"],
+                extensions: &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "pcx", "wmf", "psd", "svg", "pdf", "ai", "eps"],
             },
             OpenFilter { name: "Text (Word, RTF, plain, Excel)", extensions: &["docx", "rtf", "txt", "md", "xlsx"] },
             OpenFilter { name: "Video and sound", extensions: &["mp4", "m4v", "mov", "webm", "mp3", "m4a", "wav", "ogg"] },
@@ -640,7 +642,7 @@ mod tests {
     fn relink_open_dialog_lists_graphics() {
         let filters = super::open_filters("relink");
         let exts: Vec<&str> = filters.iter().flat_map(|filter| filter.extensions.iter().copied()).collect();
-        for ext in ["png", "jpg", "tif", "psd", "svg", "pdf", "ai", "eps"] {
+        for ext in ["png", "jpg", "tif", "pcx", "wmf", "psd", "svg", "pdf", "ai", "eps"] {
             assert!(exts.contains(&ext), "{ext} is missing from the relink dialog: {exts:?}");
         }
         assert!(!exts.contains(&"designcraft") && !exts.contains(&"idml"));

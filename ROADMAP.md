@@ -12,24 +12,15 @@
 
 DesignCraft aims at full Adobe InDesign parity — and to be better: faster, open (documented JSON format + IDML), scriptable by agents (MCP), and available on the web.
 
-- **2026-10-25** · The application bar uses craft-window's shared title-bar code. A drag that
-  starts on a floating panel over the bar moves the panel, not the window, and in full screen the
-  bar no longer zooms or moves the window. No readiness percentage change.
-- **2026-10-24** · Embedded IDML keeps independent placed-PDF layer choices in table-cell and
-  footnote text. The variant rewrite reaches endnote stories too, but IDML endnote structures and
-  artwork remain unsupported. External-only export continues to reject active nested choices.
-  Shared placement ids with different sources or choices fail closed; no readiness percentage change.
-- **2026-10-24** · PDF/A-2b preparation applies placed-PDF layer choices, including explicit all-on,
-  to anchors inside table-cell text, footnotes and endnotes in an export-only copy. The nested
-  IDML variant write pass remains separate work; no readiness percentage change.
-- **2026-10-24** · Explicit PDF layer choices, including all-on, are checked with one actual
-  rewrite per distinct source before editing; reset to file defaults bypasses the check. Native
-  format 4 covers both explicit all-on PDF layers and retained graphic-layer options. No readiness percentage change.
-- **2026-10-23** · Placed PDF layers can explicitly all be shown, separately from Use File Defaults.
-  Legacy commands keep their reset behavior; native saves require a capable reader only for
-  the new all-on state, and PDF/embedded IDML exports preserve the choice. No readiness percentage change.
-- **2026-10-23** · IDML graphic-layer export rejects parents in already closed subtrees,
-  preserving native-edited layer order through round trips. Synthetic regression added.
+- **2026-10-26** · WMF (Windows Metafile) artwork places as vector paths: GDI pens, brushes,
+  lines, polygons, rectangles, ellipses, round-rects and pixels are converted in-house to SVG
+  for screen, PDF and EPUB (PPTX rasterises it). The placeable header supplies the natural size
+  and the background is transparent. 1-bit PCX white is now transparent, matching InDesign's
+  bitmap images. Unsupported WMF content is refused with an alert instead of drawing blank.
+  No readiness percentage change.
+- **2026-10-25** · PCX (ZSoft Paintbrush) images place like the other rasters: 1-, 2-, 4- and
+  8-bit paletted, 24-bit RGB and 32-bit RGBA decode through `designcraft-images`, with header
+  sizes, PDF/EPUB export and the desktop and web place dialogs. No readiness percentage change.
 - **2026-10-23** · PDF layer choices now validate before editing all targets; rejected rewrites
   leave document/undo state intact. Null trailer entries remain unencrypted, and unsupported
   all-content crops retain the whole page rather than silently clipping hidden layers.
