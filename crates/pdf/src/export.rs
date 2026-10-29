@@ -27,476 +27,26 @@ use krilla::tagging::{Artifact, ArtifactType, ContentTag, Identifier, Tag, TagGr
 
 use crate::{ExportReport, PdfError, PdfOptions, Result, Standard};
 
-/// Export `doc` as PDF bytes.
-pub fn export_pdf(doc: &Document, cache: &Cache, opts: &PdfOptions) -> Result<Vec<u8>> {
-    export_pdf_with_report(doc, cache, opts).map(|r| r.bytes)
-}
+mod booklet;
+mod common;
+mod graphics;
+mod images;
+mod metadata;
+mod paint;
+mod pipeline;
+mod walk;
 
-/// One output page: a document page or a spread, in spread coordinates.
-pub(crate) struct Sheet {
-    pub spread: usize,
-    pub trim: Rect,
-    pub bleed: Rect,
-    pub media: Rect,
-    /// Page name(s) for the page-information mark.
-    pub label: String,
-}
-
-pub(crate) const MARK_LEN: f64 = 18.0;
-
-/// Whether a layer's items go into the PDF.
-pub(crate) fn layer_exported(layer: &designcraft_doc::Layer) -> bool {
-    layer.visible && layer.printable
-}
-
-/// Whether an item and everything inside it go into the PDF, its layer aside.
-pub(crate) fn item_exported(it: &Item) -> bool {
-    !it.hidden && !it.nonprinting
-}
-
-/// Every item of spread `si` that goes into the PDF, with its parent's transform: the items on
-/// exported layers, leaving out hidden and non-printing items with everything inside them.
-pub(crate) fn exported_items(doc: &Document, si: usize) -> Vec<(Affine, &Item)> {
-    let Some(sp) = doc.spreads.get(si) else { return Vec::new() };
-    let mut stack: Vec<(Affine, &Item)> =
-        sp.items.iter().filter(|it| doc.layer(it.layer).is_some_and(layer_exported)).map(|it| (Affine::IDENTITY, &**it)).collect();
-    let mut out = Vec::new();
-    while let Some((xf, it)) = stack.pop() {
-        if !item_exported(it) {
-            continue;
-        }
-        stack.extend(it.shown_children().map(|c| (xf * it.xf, &**c)));
-        out.push((xf, it));
-    }
-    out
-}
-
-fn bleed_lr(side: PageSide, b: [f64; 4]) -> (f64, f64) {
-    // Bleed is top, bottom, inside, outside; single-sided pages read inside as left.
-    if side == PageSide::Left { (b[3], b[2]) } else { (b[2], b[3]) }
-}
-
-/// The spread each exported PDF page shows (in page order).
-pub fn sheet_spreads(doc: &Document, opts: &PdfOptions) -> Vec<usize> {
-    sheets(doc, opts).map(|v| v.iter().map(|s| s.spread).collect()).unwrap_or_default()
-}
-
-fn sheets(doc: &Document, opts: &PdfOptions) -> Result<Vec<Sheet>> {
-    let count = doc.page_count();
-    let pages: Vec<usize> = match &opts.pages {
-        Some(v) => v.clone(),
-        None => (0..count).collect(),
-    };
-    if pages.is_empty() {
-        return Err(PdfError::NoPages);
-    }
-    if let Some(bad) = pages.iter().find(|p| **p >= count) {
-        return Err(PdfError::BadPage(bad.saturating_add(1)));
-    }
-    let b = doc.settings.bleed.map(|v| if opts.bleed { v.max(0.0) } else { 0.0 });
-    let mut out: Vec<Sheet> = Vec::new();
-    let mut seen_spreads: Vec<usize> = Vec::new();
-    for abs in pages {
-        let (si, pi) = doc.page_loc(abs).ok_or(PdfError::BadPage(abs.saturating_add(1)))?;
-        let sp: &Spread = &doc.spreads[si];
-        let (trim, l, r, label) = if opts.spreads {
-            if seen_spreads.contains(&si) {
-                continue;
-            }
-            seen_spreads.push(si);
-            let first = doc.first_page_of_spread(si);
-            // The outer edges by position: a right-to-left spread lists its right page first.
-            let outer = sp.outer_page_indices();
-            let (l, _) = outer.and_then(|(l, _)| sp.pages.get(l)).map(|p| bleed_lr(p.side, b)).unwrap_or((b[2], b[3]));
-            let (_, r) = outer.and_then(|(_, r)| sp.pages.get(r)).map(|p| bleed_lr(p.side, b)).unwrap_or((b[2], b[3]));
-            let names: Vec<String> = (0..sp.pages.len()).map(|i| doc.page_name(first + i)).collect();
-            (sp.bounds(), l, r, names.join("–"))
-        } else {
-            let p = &sp.pages[pi];
-            let (l, r) = bleed_lr(p.side, b);
-            (p.bounds(), l, r, doc.page_name(abs))
-        };
-        let bleed = Rect::new(trim.x0 - l, trim.y0 - b[0], trim.x1 + r, trim.y1 + b[1]);
-        let media = if opts.marks.any() {
-            let m = mark_start(opts, b) + MARK_LEN + 6.0;
-            trim.inflate(m, m)
-        } else {
-            bleed
-        };
-        out.push(Sheet { spread: si, trim, bleed, media, label });
-    }
-    Ok(out)
-}
-
-/// Distance from the trim edge where marks start: the offset, but never inside the bleed.
-pub(crate) fn mark_start(opts: &PdfOptions, bleed: [f64; 4]) -> f64 {
-    bleed.iter().copied().fold(opts.marks.offset.max(0.0), f64::max)
-}
-
-/// Like [`export_pdf`], also returning warnings about approximated or dropped features.
-pub fn export_pdf_with_report(doc: &Document, cache: &Cache, opts: &PdfOptions) -> Result<ExportReport> {
-    write::guard(|| export_pdf_with_report_inner(doc, cache, opts))
-}
-
-/// Form fields (Buttons and Forms) and, for interactive PDF, video and sound; not in PDF/X
-/// or PDF/A: this update comes after krilla's validator ran, and its NeedAppearances fields and
-/// Screen annotations aren't allowed in PDF/A.
-fn add_form_fields(bytes: &mut Vec<u8>, warnings: &mut Vec<String>, doc: &Document, sheets: &[Sheet], opts: &PdfOptions) {
-    let fields = crate::forms::collect(doc, sheets);
-    let media = if opts.media { crate::forms::collect_media(doc, sheets) } else { Vec::new() };
-    if fields.is_empty() && media.is_empty() {
-        return;
-    }
-    match opts.standard {
-        Standard::PdfX4 => warnings.push("PDF/X-4: form fields and media were left out".into()),
-        Standard::PdfA2b => warnings.push("PDF/A-2b: form fields and media were left out".into()),
-        _ => match crate::forms::add_fields(&*bytes, &fields, &media) {
-            Some(b) => *bytes = b,
-            None => warnings.push("form fields and media couldn't be added to this PDF".into()),
-        },
-    }
-}
-
-fn export_pdf_with_report_inner(doc: &Document, cache: &Cache, opts: &PdfOptions) -> Result<ExportReport> {
-    let sheets = sheets(doc, opts)?;
-    let warnings = Vec::new();
-    let (version, archival) = match opts.standard {
-        Standard::None => (PdfVersion::Pdf17, None),
-        Standard::PdfX4 => (PdfVersion::Pdf16, None),
-        Standard::PdfA2b => (PdfVersion::Pdf17, Some(Archival::A2_B)),
-    };
-    let configuration = write::configuration(version, archival)?;
-    let settings = krilla::SerializeSettings { compress_content_streams: opts.compress, configuration, ..Default::default() };
-    let title = opts.title.clone().unwrap_or_else(|| doc.title.clone());
-    let created = opts.created.or_else(now_unix);
-    let metadata = Metadata {
-        creator: "DesignCraft".into(),
-        producer: "DesignCraft".into(),
-        title: Some(title.clone()),
-        authors: opts.author.iter().cloned().collect(),
-        created: created.map(date_time),
-        ..Default::default()
-    };
-    let mut writer = Writer::new(settings, metadata);
-    let pdf = writer.document_mut();
-
-    let mut ex = Exporter {
-        drawing_items: Vec::new(),
-        doc,
-        cache,
-        opts,
-        clip: Rect::ZERO,
-        warnings,
-        images: HashMap::new(),
-        images_by_content: ImageContentCache::default(),
-        #[cfg(test)]
-        image_conversions: 0,
-        pdfs: HashMap::new(),
-        variants: HashMap::new(),
-        has_optional_content: false,
-        #[cfg(test)]
-        pdf_preparations: 0,
-        layer_error: None,
-        version,
-        too_new: Vec::new(),
-        svgs: HashMap::new(),
-        fonts: HashMap::new(),
-        reverse_cmaps: HashMap::new(),
-        rgb_only: archival.is_some(),
-        tags: Vec::new(),
-        story_tags: HashMap::new(),
-        tag_story: None,
-        text_area: None,
-        para_tags: HashMap::new(),
-    };
-    if ex.rgb_only {
-        ex.warn("PDF/A: CMYK colours were converted to RGB (no CMYK output intent profile is available yet)");
-    }
-    if let Some(o) = crate::links::outline(doc, &sheets) {
-        pdf.set_outline(o);
-    }
-    for (sheet_idx, sh) in sheets.iter().enumerate() {
-        let size = Size::from_wh(sh.media.width().max(1.0) as f32, sh.media.height().max(1.0) as f32).ok_or(PdfError::NoPages)?;
-        let local = |r: Rect| {
-            krilla::geom::Rect::from_ltrb(
-                (r.x0 - sh.media.x0) as f32,
-                (r.y0 - sh.media.y0) as f32,
-                (r.x1 - sh.media.x0) as f32,
-                (r.y1 - sh.media.y0) as f32,
-            )
-        };
-        let settings = PageSettings::new(size).with_trim_box(local(sh.trim)).with_bleed_box(local(sh.bleed));
-        let mut page = pdf.start_page_with(settings);
-        let mut s = page.surface();
-        #[cfg(all(test, not(target_arch = "wasm32")))]
-        unwind_tests::inject(&mut s);
-        s.push_transform(&tf(Affine::translate(-sh.media.origin().to_vec2())));
-        ex.clip = sh.bleed;
-        if let Some(clip) = to_path(&sh.bleed.to_path(0.1)) {
-            s.push_clip_path(&clip, &FillRule::NonZero);
-            ex.spread(&mut s, sh.spread);
-            s.pop();
-        }
-        if opts.tagged {
-            s.start_tagged(ContentTag::Artifact(Artifact::new(ArtifactType::Page, None)));
-        }
-        ex.marks(&mut s, sh, &title, created);
-        if opts.tagged {
-            s.end_tagged();
-        }
-        s.pop();
-        s.finish();
-        for a in crate::links::annotations(doc, cache, &sheets, sheet_idx) {
-            page.add_annotation(a);
-        }
-        page.finish();
-    }
-    if opts.tagged {
-        pdf.set_tag_tree(ex.tag_tree());
-    }
-    ex.check_placed_versions()?;
-    if let Some(error) = ex.layer_error {
-        return Err(error);
-    }
-    let mut bytes = writer.finish().map_err(PdfError::from)?;
-    // Transparency blends in the document's blend space: CMYK for print (and always in PDF/X).
-    let mut warnings = ex.warnings;
-    if !ex.rgb_only && (doc.settings.blend_space == designcraft_doc::BlendSpace::Cmyk || opts.standard == Standard::PdfX4) {
-        // The rewrite matches krilla's exact output; in PDF/X-4, `check_pdfx4` reports any
-        // group that got past it, with its page.
-        crate::pdfx::cmyk_group_spaces(&mut bytes);
-    }
-    if ex.has_optional_content {
-        bytes = crate::optional_content::register(&bytes)?;
-    }
-    add_form_fields(&mut bytes, &mut warnings, doc, &sheets, opts);
-    if opts.standard == Standard::PdfX4 {
-        // Output intent and PDF/X identification, then check the result.
-        match crate::pdfx::make_pdfx4(&bytes, &title, created) {
-            Some(b) => bytes = b,
-            None => warnings.push("PDF/X-4: the output intent couldn't be added".into()),
-        }
-        for issue in crate::pdfx::check_pdfx4(&bytes) {
-            warnings.push(format!("PDF/X-4: {issue}"));
-        }
-    }
-    warnings.dedup();
-    Ok(ExportReport { bytes, pages: sheets.len(), warnings })
-}
-
-/// One PDF from several (a book's documents), every page carried over as vectors; each part
-/// comes with its pages' sizes (points).
-pub fn merge_pdfs(parts: &[(Vec<u8>, Vec<(f32, f32)>)], title: Option<&str>) -> Result<Vec<u8>> {
-    write::guard(|| merge_pdfs_inner(parts, title))
-}
-
-fn merge_pdfs_inner(parts: &[(Vec<u8>, Vec<(f32, f32)>)], title: Option<&str>) -> Result<Vec<u8>> {
-    let metadata = Metadata { creator: "DesignCraft".into(), producer: "DesignCraft".into(), title: title.map(str::to_owned), ..Default::default() };
-    let mut writer = Writer::new(krilla::SerializeSettings::default(), metadata);
-    let pdf = writer.document_mut();
-    let mut pages = 0;
-    let mut has_optional_content = false;
-    for (bytes, sizes) in parts {
-        let variant = crate::optional_content::prepare(&Arc::new(bytes.clone()), None)?;
-        has_optional_content |= !sizes.is_empty() && variant.has_optional_content;
-        let src = krilla::pdf::Pdf::new(variant.data).map_err(|e| PdfError::Write(format!("{e:?}")))?;
-        let doc = krilla::pdf::PdfDocument::new(Arc::new(src));
-        for (i, &(w, h)) in sizes.iter().enumerate() {
-            let size = Size::from_wh(w.max(1.0), h.max(1.0)).ok_or(PdfError::NoPages)?;
-            let mut page = pdf.start_page_with(PageSettings::new(size));
-            let mut s = page.surface();
-            #[cfg(all(test, not(target_arch = "wasm32")))]
-            unwind_tests::inject(&mut s);
-            s.draw_pdf_page(&doc, size, i);
-            s.finish();
-            page.finish();
-            pages += 1;
-        }
-    }
-    if pages == 0 {
-        return Err(PdfError::NoPages);
-    }
-    let bytes = writer.finish().map_err(PdfError::from)?;
-    if has_optional_content { crate::optional_content::register(&bytes) } else { Ok(bytes) }
-}
-
-/// File › Print Booklet: how pages pair up on printer spreads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BookletKind {
-    /// Folded and stapled: pages padded to a multiple of 4, outer pages together.
-    #[default]
-    SaddleStitch,
-    /// Two pages side by side in reading order.
-    TwoUpConsecutive,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct BookletOptions {
-    pub kind: BookletKind,
-    /// Gap between the two pages of a printer spread (points).
-    pub space_between: f64,
-    pub title: Option<String>,
-}
-
-/// The printer spreads for `n` pages: (left, right) absolute page indices, `None` = blank.
-pub fn booklet_pairs(n: usize, kind: BookletKind) -> Vec<(Option<usize>, Option<usize>)> {
-    let page = |i: usize| (i < n).then_some(i);
-    match kind {
-        BookletKind::TwoUpConsecutive => (0..n.div_ceil(2)).map(|k| (page(2 * k), page(2 * k + 1))).collect(),
-        BookletKind::SaddleStitch => {
-            let m = n.div_ceil(4).max(1) * 4;
-            (0..m / 2).map(|i| if i % 2 == 0 { (page(m - 1 - i), page(i)) } else { (page(i), page(m - 1 - i)) }).collect()
-        }
-    }
-}
-
-/// An imposed PDF: two document pages per sheet, in booklet order.
-pub fn export_booklet(doc: &Document, cache: &Cache, opts: &BookletOptions) -> Result<ExportReport> {
-    write::guard(|| export_booklet_inner(doc, cache, opts))
-}
-
-fn export_booklet_inner(doc: &Document, cache: &Cache, opts: &BookletOptions) -> Result<ExportReport> {
-    let n = doc.page_count();
-    if n == 0 {
-        return Err(PdfError::NoPages);
-    }
-    let pdf_opts = PdfOptions { title: opts.title.clone(), ..PdfOptions::default() };
-    let settings = krilla::SerializeSettings { compress_content_streams: true, ..Default::default() };
-    let title = opts.title.clone().unwrap_or_else(|| doc.title.clone());
-    let metadata = Metadata { creator: "DesignCraft".into(), producer: "DesignCraft".into(), title: Some(title), ..Default::default() };
-    let mut writer = Writer::new(settings, metadata);
-    let pdf = writer.document_mut();
-    let mut ex = Exporter {
-        drawing_items: Vec::new(),
-        doc,
-        cache,
-        opts: &pdf_opts,
-        clip: Rect::ZERO,
-        warnings: Vec::new(),
-        images: HashMap::new(),
-        images_by_content: ImageContentCache::default(),
-        #[cfg(test)]
-        image_conversions: 0,
-        pdfs: HashMap::new(),
-        variants: HashMap::new(),
-        has_optional_content: false,
-        #[cfg(test)]
-        pdf_preparations: 0,
-        layer_error: None,
-        // krilla's default.
-        version: PdfVersion::Pdf17,
-        too_new: Vec::new(),
-        svgs: HashMap::new(),
-        fonts: HashMap::new(),
-        reverse_cmaps: HashMap::new(),
-        rgb_only: false,
-        tags: Vec::new(),
-        story_tags: HashMap::new(),
-        tag_story: None,
-        text_area: None,
-        para_tags: HashMap::new(),
-    };
-    let pairs = booklet_pairs(n, opts.kind);
-    // Sheet size from the largest page.
-    let (mut pw, mut ph) = (0.0f64, 0.0f64);
-    for i in 0..n {
-        if let Some((si, pi)) = doc.page_loc(i) {
-            let p = &doc.spreads[si].pages[pi];
-            pw = pw.max(p.width);
-            ph = ph.max(p.height);
-        }
-    }
-    let gap = opts.space_between.max(0.0);
-    let size = Size::from_wh((2.0 * pw + gap) as f32, ph as f32).ok_or(PdfError::NoPages)?;
-    for (left, right) in &pairs {
-        let mut page = pdf.start_page_with(PageSettings::new(size));
-        let mut s = page.surface();
-        #[cfg(all(test, not(target_arch = "wasm32")))]
-        unwind_tests::inject(&mut s);
-        for (slot, abs) in [(0.0, left), (pw + gap, right)] {
-            let Some((si, pi)) = abs.and_then(|a| doc.page_loc(a)) else { continue };
-            let p = &doc.spreads[si].pages[pi];
-            let r = Rect::new(p.x, 0.0, p.x + p.width, p.height);
-            // Pages narrower than the slot sit against the fold.
-            let dx = if slot == 0.0 { pw - p.width } else { 0.0 };
-            s.push_transform(&tf(Affine::translate((slot + dx - p.x, (ph - p.height) / 2.0))));
-            ex.clip = r;
-            if let Some(clip) = to_path(&r.to_path(0.1)) {
-                s.push_clip_path(&clip, &FillRule::NonZero);
-                ex.spread(&mut s, si);
-                s.pop();
-            }
-            s.pop();
-        }
-        s.finish();
-        page.finish();
-    }
-    ex.check_placed_versions()?;
-    if let Some(error) = ex.layer_error {
-        return Err(error);
-    }
-    let mut bytes = writer.finish().map_err(PdfError::from)?;
-    if doc.settings.blend_space == designcraft_doc::BlendSpace::Cmyk {
-        crate::pdfx::cmyk_group_spaces(&mut bytes);
-    }
-    if ex.has_optional_content {
-        bytes = crate::optional_content::register(&bytes)?;
-    }
-    let mut warnings = ex.warnings;
-    warnings.dedup();
-    Ok(ExportReport { bytes, pages: pairs.len(), warnings })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn now_unix() -> Option<i64> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
-}
-#[cfg(target_arch = "wasm32")]
-fn now_unix() -> Option<i64> {
-    None
-}
-
-fn date_time(t: i64) -> krilla::metadata::DateTime {
-    let c = civil(t);
-    krilla::metadata::DateTime::new(c.0.clamp(0, 9999) as u16)
-        .month(c.1)
-        .day(c.2)
-        .hour(c.3)
-        .minute(c.4)
-        .second(c.5)
-        .utc_offset_hour(0)
-        .utc_offset_minute(0)
-}
-
-/// Unix seconds (UTC) → (year, month, day, hour, minute, second), proleptic Gregorian. A time
-/// outside chrono's year range still converts (the calendar repeats every 400 years, so the
-/// instant is moved into range by whole cycles and only the year is carried, matching the old
-/// `civil`), rather than resetting to the epoch. `date_time` applies the PDF `0..=9999` year clamp.
-pub(crate) fn civil(t: i64) -> (i64, u8, u8, u8, u8, u8) {
-    use chrono::{Datelike, Timelike};
-    let (y, t) = designcraft_doc::time::utc_parts(t, 0);
-    (y, t.month() as u8, t.day() as u8, t.hour() as u8, t.minute() as u8, t.second() as u8)
-}
-
-/// A successful conversion and its name-independent diagnostic. Replayed once for each asset.
-#[derive(Clone)]
-struct ConvertedImage {
-    image: Image,
-    warning: Option<&'static str>,
-}
-
-const CMYK_FALLBACK_WARNING: &str = "converted to RGB (a CMYK TIFF that is planar, has premultiplied alpha, uses other inks or is over 256 MiB)";
-
-#[cfg(not(test))]
-type ImageContentCache = HashMap<Arc<Vec<u8>>, ConvertedImage>;
-
-// Unit tests force collisions through the real cache path; production keeps RandomState.
+pub use booklet::{BookletKind, BookletOptions, booklet_pairs, export_booklet, merge_pdfs};
+use common::TagEntry;
+pub(crate) use common::{norm, q, registration, regular, solid_fill, tf, to_path};
+use graphics::CoverageImage;
 #[cfg(test)]
-type ImageContentCache = HashMap<Arc<Vec<u8>>, ConvertedImage, std::hash::BuildHasherDefault<ConstantImageHasher>>;
-#[cfg(test)]
-#[derive(Default)]
-struct ConstantImageHasher;
+use images::ConstantImageHasher;
+pub(crate) use images::SRGB_ICC;
+use images::{CmykImage, GreyImage, ImageContentCache, RasterMode, SrgbImage, embedded_icc, is_grey, is_grey_icc};
+pub(crate) use metadata::civil;
+pub(crate) use pipeline::{MARK_LEN, Sheet, exported_items, mark_start};
+pub use pipeline::{export_pdf, export_pdf_with_report, print_color, sheet_spreads};
 #[cfg(test)]
 impl std::hash::Hasher for ConstantImageHasher {
     fn finish(&self) -> u64 {
@@ -507,6 +57,8 @@ impl std::hash::Hasher for ConstantImageHasher {
 
 pub(crate) struct Exporter<'a> {
     pub doc: &'a Document,
+    /// The document's inks with its Ink Manager settings.
+    pub(crate) inks: craft_prepress::InkSet,
     pub cache: &'a Cache,
     pub opts: &'a PdfOptions,
     /// Current sheet's visible area (spread space) for culling.
@@ -1623,6 +1175,12 @@ impl CoverageImage {
         let grey = rgba.pixels().map(|p| ((u16::from(255 - p[0]) * u16::from(p[3]) + 127) / 255) as u8).collect();
         Some(Self { grey: Arc::new(grey), size })
     }
+
+    /// Coverage given directly, one byte per pixel; `None` when the size doesn't match.
+    fn from_grey(grey: Arc<Vec<u8>>, size: (u32, u32)) -> Option<Self> {
+        let n = usize::try_from(u64::from(size.0) * u64::from(size.1)).ok()?;
+        (n > 0 && grey.len() == n).then_some(Self { grey, size })
+    }
 }
 
 impl krilla::image::CustomImage for CoverageImage {
@@ -1646,148 +1204,10 @@ impl krilla::image::CustomImage for CoverageImage {
     }
 }
 
-/// `data` with its `%PDF-x.y` header (within the first 1024 bytes, where readers look for it)
-/// changed from `from` to `to`, both the same length. `None` when the header isn't `from`.
-fn relabel_pdf_header(data: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
-    if from.len() != to.len() {
-        return None;
-    }
-    let head = data.get(..data.len().min(1024))?;
-    let at = head.windows(from.len()).position(|w| w == from)?;
-    let mut out = data.to_vec();
-    out.get_mut(at..at + to.len())?.copy_from_slice(to);
-    Some(out)
-}
-
-/// `data` with every `/Version /1.7` changed to `/Version /1.6` in place, so the xref offsets
-/// hold. The catalog's `/Version` wins over the header (TCPDF writes both), so relabelling the
-/// header alone leaves the file a PDF 1.7. A catalog inside a compressed object stream is left as
-/// it is, and the version check still names the file.
-fn relabel_catalog_version(mut data: Vec<u8>) -> Vec<u8> {
-    const KEY: &[u8] = b"/Version";
-    let mut from = 0;
-    while let Some(at) = data.get(from..).and_then(|rest| rest.windows(KEY.len()).position(|w| w == KEY)) {
-        let mut i = from + at + KEY.len();
-        while data.get(i).is_some_and(|b| b" \t\r\n\x0c\0".contains(b)) {
-            i += 1;
-        }
-        let ends = data.get(i + 4).is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'.');
-        if data.get(i..i + 4) == Some(b"/1.7".as_slice())
-            && ends
-            && let Some(b) = data.get_mut(i + 3)
-        {
-            *b = b'6';
-        }
-        from = i;
-    }
-    data
-}
-
-/// The sRGB profile (ICC v2.1) that untagged RGB images carry in PDF/X-4.
-pub(crate) static SRGB_ICC: &[u8] = include_bytes!("../../../assets/icc/sRGB-v2-magic.icc");
-
-/// How raster images are written for the export's standard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RasterMode {
-    /// `/Interpolate true`: smoother upscaling in viewers. PDF/X-4 and PDF/A don't allow it.
-    interpolate: bool,
-    /// Give RGB images with no ICC profile of their own the sRGB profile: under PDF/X-4's CMYK
-    /// output intent, RGB must be colour-managed.
-    tag_rgb: bool,
-}
-
 impl RasterMode {
     fn for_standard(standard: Standard) -> Self {
-        Self { interpolate: standard == Standard::None, tag_rgb: standard == Standard::PdfX4 }
+        Self { interpolate: standard == Standard::None, tag_rgb: standard.is_pdfx() }
     }
-}
-
-/// The ICC profile embedded in an image file, if it has one.
-fn embedded_icc(data: &[u8]) -> Option<Vec<u8>> {
-    use image::ImageDecoder;
-    let mut dec = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().ok()?.into_decoder().ok()?;
-    dec.icc_profile().ok().flatten()
-}
-
-/// Whether an ICC profile describes RGB (its colour space signature, header bytes 16 to 20).
-fn is_rgb_icc(icc: &[u8]) -> bool {
-    icc.get(16..20) == Some(b"RGB ".as_slice())
-}
-
-/// Whether an ICC profile describes grey.
-fn is_grey_icc(icc: &[u8]) -> bool {
-    icc.get(16..20) == Some(b"GRAY".as_slice())
-}
-
-/// Whether `data` decodes to grey (with or without alpha), read from its header.
-fn is_grey(data: &[u8]) -> bool {
-    use image::ImageDecoder;
-    image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .ok()
-        .and_then(|r| r.into_decoder().ok())
-        .is_some_and(|dec| !dec.color_type().has_color())
-}
-
-/// A JPEG, passed through. With `tag_rgb`, a JPEG keeps its own profile, and one without gets
-/// sRGB. krilla uses a profile only when its channels match the JPEG's, so a grey or CMYK JPEG
-/// without a profile stays DeviceGray or DeviceCMYK.
-fn jpeg(data: krilla::Data, icc: impl FnOnce() -> Option<Vec<u8>>, mode: RasterMode) -> Option<Image> {
-    if !mode.tag_rgb {
-        return Image::from_jpeg(data, mode.interpolate).ok();
-    }
-    let icc: krilla::Data = match icc() {
-        Some(own) => own.into(),
-        None => SRGB_ICC.into(),
-    };
-    Image::from_jpeg_with_icc(data, Some(icc), mode.interpolate).ok()
-}
-
-/// Whether krilla would write this PNG, GIF or WebP as untagged RGB: not grey, and no profile of
-/// its own.
-fn untagged_rgb(data: &[u8]) -> bool {
-    use image::ImageDecoder;
-    let Some(mut dec) = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().ok().and_then(|r| r.into_decoder().ok()) else {
-        return false;
-    };
-    let grey = matches!(dec.color_type(), image::ColorType::L8 | image::ColorType::La8 | image::ColorType::L16 | image::ColorType::La16);
-    !grey && dec.icc_profile().ok().flatten().is_none()
-}
-
-fn lossless(data: &Arc<Vec<u8>>, fmt: Option<image::ImageFormat>, mode: RasterMode) -> Option<Image> {
-    // krilla reads PNG, GIF and WebP lazily: a damaged file is accepted here and fails the whole
-    // export when the PDF is written. Decoding it first means it is skipped, like any other
-    // image that can't be decoded.
-    let rgba = designcraft_images::decode_rgba(data)?;
-    let i = mode.interpolate;
-    let direct = match fmt {
-        Some(image::ImageFormat::Png | image::ImageFormat::Gif | image::ImageFormat::WebP) if mode.tag_rgb && untagged_rgb(data) => None,
-        Some(image::ImageFormat::Png) => Image::from_png(data.clone().into(), i).ok(),
-        Some(image::ImageFormat::Gif) => Image::from_gif(data.clone().into(), i).ok(),
-        Some(image::ImageFormat::WebP) => Image::from_webp(data.clone().into(), i).ok(),
-        _ => None,
-    };
-    direct.or_else(|| {
-        // A grey TIFF, BMP… stays DeviceGray, as a grey PNG or JPEG does (#1426).
-        if let Some(grey) = GreyImage::new(data) {
-            return Image::from_custom(grey, i).ok();
-        }
-        // TIFF, BMP, PSD composites… and, with `tag_rgb`, untagged RGB.
-        if mode.tag_rgb {
-            return SrgbImage::new(rgba).and_then(|img| Image::from_custom(img, i).ok());
-        }
-        let (w, h) = rgba.dimensions();
-        Some(Image::from_rgba8(rgba.into_raw(), w, h))
-    })
-}
-
-/// An RGB raster tagged with the sRGB profile, for PDF/X-4.
-#[derive(Clone, Hash)]
-struct SrgbImage {
-    rgb: Arc<Vec<u8>>,
-    /// Only when some pixel is not opaque.
-    alpha: Option<Arc<Vec<u8>>>,
-    size: (u32, u32),
 }
 
 impl SrgbImage {
@@ -1824,17 +1244,6 @@ impl krilla::image::CustomImage for SrgbImage {
     fn color_space(&self) -> krilla::image::ImageColorspace {
         krilla::image::ImageColorspace::Rgb
     }
-}
-
-/// A grey raster as a DeviceGray image (ICCBased when the file has a grey profile of its own), so
-/// a page that only holds black prints as black, not as RGB.
-#[derive(Clone, Hash)]
-struct GreyImage {
-    grey: Arc<Vec<u8>>,
-    /// Only when some pixel is not opaque.
-    alpha: Option<Arc<Vec<u8>>>,
-    size: (u32, u32),
-    icc: Option<Arc<Vec<u8>>>,
 }
 
 impl GreyImage {
@@ -1880,13 +1289,6 @@ impl krilla::image::CustomImage for GreyImage {
         krilla::image::ImageColorspace::Luma
     }
 }
-
-/// A CMYK raster as a krilla image: its samples are written unchanged as DeviceCMYK, like a
-/// CMYK JPEG's. An embedded ICC profile is left out, as it is for JPEGs: the inks are meant for
-/// the output intent's press, and tagging them with another CMYK profile would let a RIP
-/// convert 100% K to four-colour black.
-#[derive(Clone, Hash)]
-struct CmykImage(Arc<designcraft_images::CmykRaster>);
 
 impl krilla::image::CustomImage for CmykImage {
     fn color_channel(&self) -> &[u8] {
@@ -2332,91 +1734,5 @@ mod unwind_tests {
             assert!(!hayro_syntax::Pdf::new(Arc::new(fresh)).unwrap().pages().is_empty(), "fresh {entry} export must still work");
         }
         println!("all three export entry points recovered");
-    }
-}
-
-#[cfg(test)]
-mod eps_tests {
-    use super::*;
-    use hayro_syntax::object::Name;
-
-    #[test]
-    fn eps_tiff_preview_keeps_cmyk_inks_in_pdf() {
-        let pixels = vec![0u8, 0, 0, 255, 0, 255, 255, 0];
-        let mut tiff = Vec::new();
-        tiff::encoder::TiffEncoder::new(std::io::Cursor::new(&mut tiff))
-            .unwrap()
-            .write_image::<tiff::encoder::colortype::CMYK8>(2, 1, &pixels)
-            .unwrap();
-        let ps = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 2 1\n%%EOF\n";
-        let mut eps = vec![0xC5, 0xD0, 0xD3, 0xC6];
-        for value in [30usize, ps.len(), 0, 0, 30 + ps.len(), tiff.len()] {
-            eps.extend((value as u32).to_le_bytes());
-        }
-        eps.extend([0xFF, 0xFF]);
-        eps.extend_from_slice(ps);
-        eps.extend_from_slice(&tiff);
-        assert_eq!(designcraft_images::eps_proxy(&eps).unwrap().0, tiff);
-        let mut doc = Document::new(&designcraft_doc::build::NewDocument::default());
-        let aid = AssetId(doc.alloc());
-        doc.assets.insert(
-            aid,
-            Arc::new(designcraft_doc::Asset {
-                id: aid,
-                name: "cmyk.eps".into(),
-                mime: "application/postscript".into(),
-                link: None,
-                data: Arc::new(eps),
-                pixels: Some((2, 1)),
-                page: 0,
-                ..Default::default()
-            }),
-        );
-        let mut item = Item::new(
-            designcraft_doc::ItemId(doc.alloc()),
-            doc.default_layer(),
-            designcraft_doc::Shape::Rectangle,
-            designcraft_geom::shapes::rectangle(Rect::new(72.0, 72.0, 272.0, 172.0)),
-        );
-        item.content = Content::Graphic(designcraft_doc::Graphic {
-            asset: aid,
-            size: (2.0, 1.0),
-            xf: Affine::translate((72.0, 72.0)) * Affine::scale(100.0),
-            auto_fit: Default::default(),
-            fit_align: 4,
-            crop: [0.0; 4],
-            clip: None,
-            wrap: Default::default(),
-            fill: Default::default(),
-        });
-        doc.insert_item(designcraft_doc::SpreadRef::Doc(0), item, None).unwrap();
-        for standard in [Standard::None, Standard::PdfX4] {
-            let report = export_pdf_with_report(&doc, &Cache::new(), &PdfOptions { standard, ..Default::default() }).unwrap();
-            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-            let pdf = hayro_syntax::Pdf::new(report.bytes).unwrap();
-            let images: Vec<_> = pdf
-                .objects()
-                .into_iter()
-                .filter_map(|o| o.into_stream())
-                .filter(|s| s.dict().get::<Name>("Subtype").is_some_and(|n| n.as_str() == "Image"))
-                .map(|s| (s.dict().get::<Name>("ColorSpace").unwrap().as_str().to_string(), s.decoded().unwrap().into_owned()))
-                .collect();
-            assert_eq!(images, vec![("DeviceCMYK".to_string(), pixels.clone())], "{standard:?}");
-        }
-    }
-
-    #[test]
-    fn civil_dates_match_the_old_cycle_conversion_including_beyond_chrono() {
-        use super::civil;
-        assert_eq!(civil(0), (1970, 1, 1, 0, 0, 0));
-        assert_eq!(civil(951_782_400), (2000, 2, 29, 0, 0, 0));
-        assert_eq!(civil(1_791_504_000 + 3_723), (2026, 10, 9, 1, 2, 3));
-        // Beyond chrono's year range the old `civil` still converted; pin that output, never the
-        // epoch. `date_time` is what clamps the year to the PDF `0..=9999` range afterwards.
-        assert_eq!(civil(253_402_300_800), (10000, 1, 1, 0, 0, 0));
-        assert_eq!(civil(10_000_000_000_000), (318857, 5, 20, 17, 46, 40));
-        assert_eq!(civil(-10_000_000_000_000), (-314918, 8, 13, 6, 13, 20));
-        assert_eq!(civil(i64::MAX), (292277026596, 12, 4, 15, 30, 7));
-        assert_eq!(civil(i64::MIN), (-292277022657, 1, 27, 8, 29, 52));
     }
 }

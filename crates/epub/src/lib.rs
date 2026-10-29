@@ -16,9 +16,34 @@ use std::io::Write;
 
 use designcraft_doc::geom::{Affine, Rect};
 use designcraft_doc::{
-    Align, AnchorPosition, AnchoredObject, CharAttrs, CharProps, Content, Document, ENDNOTE_REF, FOOTNOTE_REF, Item, ItemId, OBJECT_MARK, ParaProps,
-    SpreadRef, Story, StoryId, Styles, Table, story,
+    Align, AnchorPosition, AnchoredObject, CharAttrs, CharProps, Content, Document, ENDNOTE_REF, EpubSplit, FOOTNOTE_REF, Item, ItemId, OBJECT_MARK,
+    ParaProps, SpreadRef, Story, StoryId, Styles, Table, story,
 };
+
+mod chapters;
+mod css;
+mod fonts;
+mod html;
+mod markup;
+mod package;
+mod story_writer;
+
+#[cfg(test)]
+use chapters::{CHAPTER_MARK, link_across_chapters, nav_list, split_chapters};
+#[cfg(test)]
+use css::char_css;
+pub use css::stylesheet;
+pub use fonts::{EmbeddedFont, stylesheet_fonts};
+#[cfg(test)]
+use fonts::{css_weight_style, generic_family};
+#[cfg(test)]
+use html::base64;
+pub use html::{Block, HtmlOptions, export_html, images_without_alt, reading_order};
+pub use markup::{EpubError, slug};
+#[cfg(test)]
+use package::iso8601;
+pub use package::{FixedPage, contents_title, export_epub, export_fixed_epub};
+pub use story_writer::story_html;
 
 #[derive(Clone, Debug)]
 pub struct EpubOptions {
@@ -39,242 +64,8 @@ pub struct EpubOptions {
     pub modified: Option<i64>,
     /// Title of the navigation (table of contents); from `language` when absent.
     pub toc_title: Option<String>,
-}
-
-/// A font file packaged with an EPUB: the face of `family` in `style` (`Bold Italic`…).
-#[derive(Clone, Debug)]
-pub struct EmbeddedFont {
-    pub family: String,
-    pub style: String,
-    pub data: Vec<u8>,
-}
-
-/// The `(family, style)` pairs the stylesheet names, one each, in style order: the fonts an
-/// export can embed.
-pub fn stylesheet_fonts(doc: &Document) -> Vec<(String, String)> {
-    let st: &Styles = &doc.styles;
-    let mut out: Vec<(String, String)> = Vec::new();
-    for ps in &st.paragraph {
-        if ps.name == designcraft_doc::NO_PARA_STYLE {
-            continue;
-        }
-        let (_, cp) = st.resolve_para_style(&ps.name);
-        let f = (cp.font_family.clone(), cp.font_style.clone());
-        if !f.0.is_empty() && !out.contains(&f) {
-            out.push(f);
-        }
-    }
-    out
-}
-
-/// The CSS generic family for `family`: the known one, else a guess from the name
-/// (`… Mono`/`Courier`/`… Code` → monospace, `… Sans`/`Gothic`/`Grotesk`/`Helvetica`/`Arial`/
-/// `Verdana` → sans-serif), else serif.
-fn generic_family<'a>(family: &str, known: &'a BTreeMap<String, String>) -> &'a str {
-    const GENERIC: [&str; 6] = ["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui"];
-    if let Some(g) = known.get(family).and_then(|g| GENERIC.iter().find(|x| **x == g.as_str())) {
-        return g;
-    }
-    let f = family.to_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| f.contains(w));
-    if has(&["mono", "courier", " code", "consol"]) {
-        "monospace"
-    } else if has(&["sans", "gothic", "grotesk", "grotesque", "helvetica", "arial", "verdana"]) {
-        "sans-serif"
-    } else {
-        "serif"
-    }
-}
-
-/// CSS weight and style of a style name (`Semibold Italic` → 600, italic).
-fn css_weight_style(style: &str) -> (u16, &'static str) {
-    let s = style.to_lowercase().replace([' ', '-'], "");
-    let weight = [
-        ("thin", 100),
-        ("extralight", 200),
-        ("ultralight", 200),
-        ("light", 300),
-        ("medium", 500),
-        ("semibold", 600),
-        ("demibold", 600),
-        ("extrabold", 800),
-        ("ultrabold", 800),
-        ("bold", 700),
-        ("black", 900),
-        ("heavy", 900),
-    ]
-    .iter()
-    .find(|(n, _)| s.contains(n))
-    .map_or(400, |(_, w)| *w);
-    (weight, if s.contains("italic") || s.contains("oblique") { "italic" } else { "normal" })
-}
-
-/// Package path and media type of an embedded font (`fonts/{k}-{family}-{style}.{ext}`).
-fn font_file(k: usize, f: &EmbeddedFont) -> (String, &'static str) {
-    let (ext, mime) = match f.data.get(..4) {
-        Some(b"OTTO") => ("otf", "font/otf"),
-        Some(b"wOFF") => ("woff", "font/woff"),
-        Some(b"wOF2") => ("woff2", "font/woff2"),
-        _ => ("ttf", "font/ttf"),
-    };
-    let name: String =
-        format!("{}-{}", f.family, f.style).chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
-    let name = name.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
-    (format!("fonts/{k}-{name}.{ext}"), mime)
-}
-
-/// An ISO 8601 UTC timestamp (`2026-10-13T09:30:00Z`) for Unix seconds `t`.
-/// A time outside chrono's year range still converts: the calendar repeats every 400 years, so the
-/// instant is moved into range by whole cycles and only the year is carried (matches the old
-/// `civil_from_days`), rather than resetting to the epoch.
-fn iso8601(t: i64) -> String {
-    let (y, dt) = designcraft_doc::time::utc_parts(t, 0);
-    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
-    format!("{y:04}-{}", dt.format("%m-%dT%H:%M:%SZ"))
-}
-
-/// The package's `dcterms:modified`: the given time, else the document's last save or creation.
-fn modified(doc: &Document, opts: &EpubOptions) -> String {
-    let t = opts.modified.or((doc.modified > 0).then_some(doc.modified)).or((doc.created > 0).then_some(doc.created));
-    t.map_or_else(|| "2026-01-01T00:00:00Z".to_string(), iso8601)
-}
-
-/// The book's identifier: the given one, else a `urn:uuid` derived from the title and the
-/// document's creation time, so a book keeps its identifier from export to export and two books
-/// with the same title don't share one.
-fn identifier(doc: &Document, opts: &EpubOptions, title: &str) -> String {
-    if let Some(id) = opts.identifier.clone().filter(|i| !i.trim().is_empty()) {
-        return id;
-    }
-    // Two FNV-1a 64-bit hashes (different offsets) as 128 bits, shaped as a version-5-style UUID.
-    let seed = format!("{title}\n{}", doc.created);
-    let fnv = |offset: u64| seed.bytes().fold(offset, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
-    let (a, b) = (fnv(0xcbf2_9ce4_8422_2325), fnv(0x84222325_cbf29ce4));
-    let hi = (a & 0xffff_ffff_ffff_0fff) | 0x5000;
-    let lo = (b & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
-    format!("urn:uuid:{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", hi >> 32, (hi >> 16) & 0xffff, hi & 0xffff, lo >> 48, lo & 0xffff_ffff_ffff)
-}
-
-/// Package name and media type of a cover image: JPEG by its signature, else PNG.
-fn cover_file(data: &[u8]) -> (&'static str, &'static str) {
-    if data.starts_with(&[0xFF, 0xD8, 0xFF]) { ("images/cover.jpg", "image/jpeg") } else { ("images/cover.png", "image/png") }
-}
-
-/// The table of contents' title in `language` (a BCP 47 tag or a language name's code), English
-/// for languages without one here.
-pub fn contents_title(language: &str) -> &'static str {
-    let code = language.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
-    match code.as_str() {
-        "nl" => "Inhoud",
-        "de" => "Inhalt",
-        "fr" => "Table des matières",
-        "es" | "pt" => "Índice",
-        "it" => "Indice",
-        "ja" => "目次",
-        "zh" => "目录",
-        _ => "Contents",
-    }
-}
-
-/// A page of a fixed-layout EPUB: its image (PNG), size in points and text (kept for search,
-/// read-aloud and accessibility).
-#[derive(Clone, Debug)]
-pub struct FixedPage {
-    pub png: Vec<u8>,
-    pub width: f64,
-    pub height: f64,
-    pub text: String,
-}
-
-/// A pre-paginated (fixed-layout) EPUB: one XHTML page per document page.
-pub fn export_fixed_epub(doc: &Document, pages: &[FixedPage], opts: &EpubOptions) -> Result<Vec<u8>, EpubError> {
-    let title = opts.title.clone().unwrap_or_else(|| doc.title.clone());
-    let lang = language_tag(&opts.language);
-    let id = identifier(doc, opts, &title);
-    let modified = modified(doc, opts);
-    let mut manifest = String::from("<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n");
-    let mut spine = String::new();
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut nav_items = String::new();
-    for (i, p) in pages.iter().enumerate() {
-        let n = i + 1;
-        let (w, h) = (p.width.round().max(1.0) as u32, p.height.round().max(1.0) as u32);
-        let xhtml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"{lang}\" lang=\"{lang}\">\n<head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width={w}, height={h}\"/><title>{} — {n}</title>\n<style>body{{margin:0;width:{w}px;height:{h}px;position:relative}} img{{position:absolute;left:0;top:0;width:{w}px;height:{h}px}} .t{{position:absolute;left:0;top:0;width:{w}px;color:transparent;font-size:1px;overflow:hidden}}</style></head>\n<body><img src=\"pages/p{n}.png\" alt=\"\"/><div class=\"t\">{}</div></body>\n</html>\n",
-            xml_text(&title),
-            story_markup(&p.text).replace('\n', "<br/>")
-        );
-        let _ = writeln!(
-            manifest,
-            "<item id=\"page{n}\" href=\"page{n}.xhtml\" media-type=\"application/xhtml+xml\"/>\n<item id=\"pimg{n}\" href=\"pages/p{n}.png\" media-type=\"image/png\"{}/>",
-            if n == 1 { " properties=\"cover-image\"" } else { "" }
-        );
-        let _ = writeln!(spine, "<itemref idref=\"page{n}\"/>");
-        let _ = write!(nav_items, "<li><a href=\"page{n}.xhtml\">{n}</a></li>");
-        files.push((format!("OEBPS/page{n}.xhtml"), xhtml.into_bytes()));
-        files.push((format!("OEBPS/pages/p{n}.png"), p.png.clone()));
-    }
-    let (vw, vh) = pages.first().map_or((612, 792), |p| (p.width.round() as u32, p.height.round() as u32));
-    let nav = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" xml:lang=\"{lang}\">\n<head><meta charset=\"utf-8\"/><title>{}</title></head>\n<body><nav epub:type=\"page-list\" id=\"toc\"><h1>Pages</h1><ol>{nav_items}</ol></nav></body>\n</html>\n",
-        xml_text(&title)
-    );
-    let rendition = format!(
-        "\n<meta property=\"rendition:layout\">pre-paginated</meta>\n<meta property=\"rendition:spread\">auto</meta>\n<meta name=\"original-resolution\" content=\"{vw}x{vh}\"/>"
-    );
-    let head = PackageHead { lang, id: &id, title: &title, author: opts.author.as_deref(), modified: &modified };
-    let opf = package_opf(&head, " prefix=\"rendition: http://www.idpf.org/vocab/rendition/#\"", &rendition, &manifest, &spine);
-    let entries = files.iter().map(|(name, data)| (name.clone(), data.as_slice(), name.ends_with(".png")));
-    write_package(&opf, &nav, entries)
-}
-
-/// The package metadata both EPUB flavours share.
-struct PackageHead<'a> {
-    lang: &'a str,
-    id: &'a str,
-    title: &'a str,
-    author: Option<&'a str>,
-    modified: &'a str,
-}
-
-/// The OPF package document. `prefix` goes on `<package>` (with its leading space), `meta` after
-/// `dcterms:modified` (with its leading newline); `manifest` and `spine` are the item lines.
-fn package_opf(h: &PackageHead, prefix: &str, meta: &str, manifest: &str, spine: &str) -> String {
-    let PackageHead { lang, id, title, author, modified } = h;
-    let author = author.map(|a| format!("<dc:creator>{}</dc:creator>", xml_text(a))).unwrap_or_default();
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"bookid\" xml:lang=\"{lang}\"{prefix}>\n<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n<dc:identifier id=\"bookid\">{}</dc:identifier>\n<dc:title>{}</dc:title>\n<dc:language>{lang}</dc:language>{author}\n<meta property=\"dcterms:modified\">{modified}</meta>{meta}\n<meta name=\"generator\" content=\"DesignCraft\"/>\n</metadata>\n<manifest>\n{manifest}</manifest>\n<spine>\n{spine}</spine>\n</package>\n",
-        xml_text(id),
-        xml_text(title)
-    )
-}
-
-/// Zips an EPUB: the stored `mimetype`, `container.xml`, the OPF and nav, then `entries` in order
-/// as (path, bytes, stored uncompressed).
-fn write_package<'a>(opf: &str, nav: &str, entries: impl IntoIterator<Item = (String, &'a [u8], bool)>) -> Result<Vec<u8>, EpubError> {
-    let io = |e: std::io::Error| EpubError(e.to_string());
-    let zerr = |e: zip::result::ZipError| EpubError(e.to_string());
-    let container = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>\n";
-    let mut buf = std::io::Cursor::new(Vec::new());
-    {
-        let mut z = zip::ZipWriter::new(&mut buf);
-        let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        let deflate = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        z.start_file("mimetype", stored).map_err(zerr)?;
-        z.write_all(b"application/epub+zip").map_err(io)?;
-        for (name, data) in
-            [("META-INF/container.xml", container.as_bytes()), ("OEBPS/content.opf", opf.as_bytes()), ("OEBPS/nav.xhtml", nav.as_bytes())]
-        {
-            z.start_file(name, deflate).map_err(zerr)?;
-            z.write_all(data).map_err(io)?;
-        }
-        for (name, data, store) in entries {
-            z.start_file(name, if store { stored } else { deflate }).map_err(zerr)?;
-            z.write_all(data).map_err(io)?;
-        }
-        z.finish().map_err(zerr)?;
-    }
-    Ok(buf.into_inner())
+    /// Split Document: where content files start; the document's setting when absent.
+    pub split: Option<EpubSplit>,
 }
 
 impl Default for EpubOptions {
@@ -289,12 +80,10 @@ impl Default for EpubOptions {
             fonts: Vec::new(),
             modified: None,
             toc_title: None,
+            split: None,
         }
     }
 }
-
-#[derive(Debug)]
-pub struct EpubError(pub String);
 
 impl std::fmt::Display for EpubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

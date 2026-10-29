@@ -32,10 +32,11 @@ use crate::export::{Exporter, solid_fill, tf, to_path};
 
 impl Exporter<'_> {
     /// A text run's paint: solid, or a gradient spanning the frame's box (`area`, text space),
-    /// for glyphs drawn under `origin` (text space ← run space).
-    fn text_paint(&mut self, swatch: &str, tint: f32, origin: Affine, area: Rect) -> Option<Paint> {
+    /// for glyphs drawn under `origin` (text space ← run space). `overprint`: the run's
+    /// overprint attribute for this paint.
+    fn text_paint(&mut self, swatch: &str, tint: f32, overprint: bool, origin: Affine, area: Rect) -> Option<Paint> {
         if designcraft_color::swatch::resolve_gradient(&self.doc.swatches, swatch).is_some() && origin.determinant().abs() > 1e-12 {
-            let fill = designcraft_doc::Fill { swatch: swatch.into(), tint, ..designcraft_doc::Fill::none() };
+            let fill = designcraft_doc::Fill { swatch: swatch.into(), tint, overprint, ..designcraft_doc::Fill::none() };
             return self.fill_paint_in(&fill, self.text_area.unwrap_or(area), origin.inverse());
         }
         self.swatch_color(swatch, tint).map(Into::into)
@@ -233,6 +234,34 @@ impl Exporter<'_> {
         }
     }
 
+    /// One line's glyphs as tagged runs; a glyph that is turned or slanted gets a transform of its own.
+    fn line_glyphs(&mut self, s: &mut Surface, cs: &ComposedStory, ft: &FrameText, l: &designcraft_compose::Line, story: &str) {
+        let gs = &l.glyphs;
+        let mut i = 0;
+        while i < gs.len() {
+            let g = &gs[i];
+            if !g.visible || g.sx <= 0.0 || g.sy <= 0.0 {
+                i += 1;
+                continue;
+            }
+            // Vertical type: an upright glyph turns back a quarter about its em box centre.
+            // Shatai slants each glyph about its own em box centre first.
+            let turn = if ft.vertical { g.vertical_xf(l.baseline) } else { None };
+            let shatai = cs.styles.get(g.style as usize).and_then(|st| st.shatai_xf(g, l.baseline));
+            if turn.is_some() || shatai.is_some() {
+                let m = turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY);
+                s.push_transform(&crate::export::tf(m));
+                self.tagged_run(s, cs, &gs[i..i + 1], l.baseline, story);
+                s.pop();
+                i += 1;
+                continue;
+            }
+            let j = run_end(ft, gs, i);
+            self.tagged_run(s, cs, &gs[i..j], l.baseline, story);
+            i = j;
+        }
+    }
+
     pub(crate) fn frame_text(&mut self, s: &mut Surface, cs: &ComposedStory, ft: &FrameText, story: &str) {
         // Paragraph shading and rules under the text.
         self.as_artifact(s, |me, s| {
@@ -260,30 +289,7 @@ impl Exporter<'_> {
             });
         }
         for l in &ft.lines {
-            let gs = &l.glyphs;
-            let mut i = 0;
-            while i < gs.len() {
-                let g = &gs[i];
-                if !g.visible || g.sx <= 0.0 || g.sy <= 0.0 {
-                    i += 1;
-                    continue;
-                }
-                // Vertical type: an upright glyph turns back a quarter about its em box centre.
-                // Shatai slants each glyph about its own em box centre first.
-                let turn = if ft.vertical { g.vertical_xf(l.baseline) } else { None };
-                let shatai = cs.styles.get(g.style as usize).and_then(|st| st.shatai_xf(g, l.baseline));
-                if turn.is_some() || shatai.is_some() {
-                    let m = turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY);
-                    s.push_transform(&crate::export::tf(m));
-                    self.tagged_run(s, cs, &gs[i..i + 1], l.baseline, story);
-                    s.pop();
-                    i += 1;
-                    continue;
-                }
-                let j = run_end(ft, gs, i);
-                self.tagged_run(s, cs, &gs[i..j], l.baseline, story);
-                i = j;
-            }
+            self.line_glyphs(s, cs, ft, l, story);
         }
         self.as_artifact(s, |me, s| {
             for (rule, r) in text_rules(cs, ft, false) {
@@ -326,10 +332,16 @@ impl Exporter<'_> {
     fn tables(&mut self, s: &mut Surface, ft: &FrameText) {
         for t in &ft.tables {
             for c in &t.cells {
-                if let Some((sw, tint)) = &c.fill
-                    && let Some(col) = self.swatch_color(sw, *tint)
-                {
-                    self.fill_rect(s, c.rect, col);
+                if let Some((sw, tint)) = &c.fill {
+                    let fill = designcraft_doc::Fill { swatch: sw.clone(), tint: *tint, ..designcraft_doc::Fill::none() };
+                    if let Some(paint) = self.fill_paint(&fill, t.rect)
+                        && let Some(path) = to_path(&c.rect.to_path(0.1))
+                    {
+                        s.set_stroke(None);
+                        s.set_fill(Some(paint_fill(paint)));
+                        s.draw_path(&path);
+                        s.set_fill(None);
+                    }
                 }
             }
             for c in &t.cells {
@@ -479,18 +491,18 @@ impl Exporter<'_> {
         // Outside a frame (no text area), a gradient spans the run.
         let end = glyphs.last().map_or(g0.x, |g| g.x + g.adv);
         let run_area = Rect::new(g0.x, baseline - size, end.max(g0.x + 1.0), baseline + size * 0.25);
-        let fill = self.text_paint(&st.fill, st.fill_tint, origin, run_area);
+        let fill = self.text_paint(&st.fill, st.fill_tint, st.overprint_fill, origin, run_area);
         let stroke = if st.stroke != designcraft_color::swatch::NONE && st.stroke_weight > 0.0 {
-            self.text_paint(&st.stroke, st.stroke_tint, origin, run_area)
+            self.text_paint(&st.stroke, st.stroke_tint, st.overprint_stroke, origin, run_area)
         } else {
             None
         };
         if fill.is_none() && stroke.is_none() {
             return;
         }
-        if st.overprint_fill || st.overprint_stroke {
-            self.warn("overprint is not exported yet");
-        }
+        let fill_op = fill.is_some() && self.overprints(&st.fill, st.fill_tint, st.overprint_fill);
+        let stroke_op = stroke.is_some() && self.overprints(&st.stroke, st.stroke_tint, st.overprint_stroke);
+        let overprint = self.push_overprint(s, fill_op, stroke_op);
         // Stroke behind fill: a double-width stroke first, as outlines so the text is not
         // duplicated, then the fill over its inner half. With no fill, the stroke is clipped
         // to the outside of the glyphs instead.
@@ -519,6 +531,9 @@ impl Exporter<'_> {
             self.paint_outlines(s, &glyph_outlines(glyphs, size, tan), origin, fill, stroke, weight);
         }
         if clipped {
+            s.pop();
+        }
+        if overprint {
             s.pop();
         }
     }

@@ -103,6 +103,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Executable and icon carry the display name (CFBundleExecutable / CFBundleIconFile).
 cp "$WORK/bin/designcraft" "$APP/Contents/MacOS/DesignCraft"
 cp "$ROOT/assets/app-icon/designcraft.icns" "$APP/Contents/Resources/DesignCraft.icns"
+# Required embedded-font notices are independent of optional font inputs.
+cp "$ROOT/NOTICE" "$APP/Contents/Resources/NOTICE"
 # Licences of the embedded craft-fonts fonts (only when built with CRAFT_FONTS_DIR).
 copy_font_licences "$APP/Contents/Resources"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \

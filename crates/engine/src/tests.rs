@@ -2,6 +2,15 @@ use serde_json::json;
 
 use super::*;
 
+mod autosize;
+mod file_guard;
+mod idml;
+mod ime;
+mod linked_paths;
+mod params;
+mod roots;
+mod table;
+
 fn session() -> Session {
     let mut s = Session::new();
     s.execute("file.new", &json!({"pages": 2})).unwrap();

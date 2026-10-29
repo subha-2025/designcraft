@@ -300,7 +300,19 @@ mod tests {
     }
 
     fn s(p: PathBuf) -> String {
-        p.to_string_lossy().into_owned()
+        let text = p.to_string_lossy();
+        if !cfg!(windows) {
+            return text.into_owned();
+        }
+        // A canonical path on Windows has a `\\?\` prefix, under which `..` is not a name:
+        // send ordinary paths, as the roots show them.
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) => rest.to_owned(),
+            None => text.into_owned(),
+        }
     }
 
     #[test]
@@ -412,9 +424,11 @@ mod tests {
     /// siblings `in2` and `scratch2` whose names start like a root's, and a file in their parent.
     /// The folder is returned resolved (`/var` is `/private/var` on macOS), as the roots show it, so
     /// a path that passes only because it was resolved is the case being tested and nothing else.
+    /// It has no `\\?\` prefix on Windows, where the roots are shown without it and `..` is not
+    /// resolved in a path that has it.
     fn several(name: &str) -> (PathBuf, Arc<AutomationRoots>) {
         let (base, _) = folders(name);
-        let base = std::fs::canonicalize(base).unwrap();
+        let base = plain(std::fs::canonicalize(base).unwrap());
         for d in ["shared", "scratch", "scratch2"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
@@ -492,7 +506,7 @@ mod tests {
         assert!(e.starts_with("cannot open the automation write root"), "{e}");
         // A folder given twice (here once through `..`) counts once.
         let twice = AutomationRoots::new(&[&base.join("in"), &base.join("in/sub/.."), &base.join("in")], &[]).unwrap().unwrap();
-        let real = std::fs::canonicalize(&base).unwrap();
+        let real = plain(std::fs::canonicalize(&base).unwrap());
         assert_eq!(twice.describe(), format!("read {}; write none", s(real.join("in"))));
         let e = twice.check(s(base.join("outside/x")), Access::Read).unwrap_err();
         assert!(e.contains("outside the read root ") && !e.contains("roots"), "{e}");

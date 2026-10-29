@@ -922,6 +922,13 @@ pub fn paint(p: &Painter, r: Rect, name: &str, c: Color32) {
             pen.line(&[(12.0, 3.5), (12.0, 16.5)]);
             pen.line(&[(9.0, 10.0), (11.0, 10.0)]);
         }
+        "small-caps" => {
+            // Two original T shapes share a baseline; no phonetic small-cap glyph is required.
+            pen.line(&[(3.0, 5.0), (10.0, 5.0)]);
+            pen.line(&[(6.5, 5.0), (6.5, 15.0)]);
+            pen.line(&[(12.0, 8.0), (17.0, 8.0)]);
+            pen.line(&[(14.5, 8.0), (14.5, 15.0)]);
+        }
         "font-size" => {
             pen.text(6.0, 12.5, "T", 10.0);
             pen.text(13.0, 10.5, "T", 17.0);
@@ -1158,7 +1165,7 @@ pub fn button(ui: &mut egui::Ui, name: &str, size: f32, selected: bool, tip: &st
     let pad = size * 0.16;
     paint(ui.painter(), r.shrink(pad), name, if selected { t.text_strong } else { t.icon });
     let enabled = ui.is_enabled();
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, tip));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, enabled, selected, tip));
     if tip.is_empty() {
         resp
     } else {

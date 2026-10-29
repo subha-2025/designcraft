@@ -5,7 +5,8 @@
 //!
 //! IME: the marked text of a composition is a preview of `text.insert` at the caret (so it lays
 //! out in place like typed text), underlined, until the IME commits it (one `text.insert`, one
-//! undo step) or clears it (the preview goes, leaving no undo step).
+//! undo step) or clears it (the preview goes, leaving no undo step). A delete-surrounding batch
+//! is one `text.deleteSurrounding` instead; the engine runs it through the command pipeline.
 
 use std::ops::Range;
 
@@ -134,6 +135,13 @@ impl TypeTool {
     pub fn vertical() -> Self {
         TypeTool { vertical: true, ..Default::default() }
     }
+}
+
+/// The text an IME commit types: `\r` becomes a paragraph break, and other control characters
+/// are dropped (Tab and the line break stay). The engine and the UI share this so a commit's
+/// exact accepted text is known without inspecting the document.
+pub fn ime_commit_text(text: &str) -> String {
+    text.chars().map(|c| if c == '\r' { '\n' } else { c }).filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
 }
 
 /// Byte range in `s` of the characters `r` (IME ranges count characters; carets count bytes).
@@ -441,8 +449,9 @@ impl Tool for TypeTool {
         out
     }
 
+    /// Normalize commit text, cancel marked text, and emit one `text.insert` when text remains and a text selection is active.
     fn ime_commit(&mut self, cx: &ToolContext, text: &str) -> Vec<Action> {
-        let text: String = text.chars().map(|c| if c == '\r' { '\n' } else { c }).filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+        let text = ime_commit_text(text);
         // The marked text goes; the result is typed in its place like any typing: one command,
         // one undo step.
         let mut out = if self.preedit.take().is_some() { vec![Action::Cancel] } else { vec![] };

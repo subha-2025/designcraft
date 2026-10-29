@@ -14,6 +14,24 @@ use crate::names::{self, CHAR_BUILTINS, OBJECT_BUILTINS, PARA_BUILTINS, escape_i
 use crate::xml::{El, Node, document, document_with_pi};
 use crate::{DOM_VERSION, MIMETYPE, base64_encode};
 
+mod common;
+mod designmap;
+mod fonts_prefs;
+mod graphics;
+mod item;
+mod spread;
+mod story;
+mod styles;
+mod table;
+mod text_attrs;
+
+use common::pkg_root;
+pub(crate) use common::uid;
+use designmap::{CONTAINER, metadata_xmp};
+pub(crate) use item::corner_names;
+#[cfg(test)]
+pub(crate) use item::path_to_uri;
+
 const PKG_NS: &str = "http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging";
 const NO_PARA_ID: &str = "ParagraphStyle/$ID/[No paragraph style]";
 const TOC_STYLE_ID: &str = "TOCStyle/Table of Contents";
@@ -69,67 +87,6 @@ fn zip_parts(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
     // Writing into memory cannot fail except on internal errors; return what we have then.
     let _ = write();
     w.finish().map(|c| c.into_inner()).unwrap_or_default()
-}
-
-pub(crate) fn uid(n: u64) -> String {
-    format!("u{n:x}")
-}
-
-fn p(name: &str, ty: &str, val: impl Into<String>) -> El {
-    El::new(name).attr("type", ty).text(val)
-}
-
-/// Insert a `<Properties>` element as the first child when there are any.
-fn with_props(mut el: El, props: Vec<El>) -> El {
-    if !props.is_empty() {
-        let mut pe = El::new("Properties");
-        pe.children = props.into_iter().map(Node::El).collect();
-        el.children.insert(0, Node::El(pe));
-    }
-    el
-}
-
-fn pkg_root(kind: &str) -> El {
-    El::new(&format!("idPkg:{kind}")).attr("xmlns:idPkg", PKG_NS).attr("DOMVersion", DOM_VERSION)
-}
-
-fn bool_s(b: bool) -> &'static str {
-    if b { "true" } else { "false" }
-}
-
-fn pct(v: f64) -> String {
-    num(v * 100.0)
-}
-
-/// (model, space, value) for a colour.
-fn color_value(c: &Color) -> (&'static str, String) {
-    match *c {
-        Color::Cmyk { c, m, y, k } => ("CMYK", format!("{} {} {} {}", pct(c as f64), pct(m as f64), pct(y as f64), pct(k as f64))),
-        Color::Rgb { r, g, b } => ("RGB", format!("{} {} {}", num(r as f64 * 255.0), num(g as f64 * 255.0), num(b as f64 * 255.0))),
-        Color::Gray { k } => ("CMYK", format!("0 0 0 {}", pct(k as f64))),
-    }
-}
-
-/// The IDML spread origin in our spread coordinates.
-pub(crate) fn spread_origin(sp: &Spread, facing: bool) -> (f64, f64) {
-    let h = sp.pages.iter().map(|p| p.height).fold(0.0, f64::max);
-    let b = sp.bounds();
-    let ox = if facing {
-        if let Some(r) = sp.pages.iter().find(|p| p.side == PageSide::Right) {
-            r.x
-        } else if let Some(l) = sp.pages.iter().rev().find(|p| p.side == PageSide::Left) {
-            l.x + l.width
-        } else {
-            b.center().x
-        }
-    } else {
-        b.center().x
-    };
-    (ox, h / 2.0)
-}
-
-fn affine_s(a: Affine) -> String {
-    a.as_coeffs().iter().map(|v| num(*v)).collect::<Vec<_>>().join(" ")
 }
 
 struct Ex<'a> {

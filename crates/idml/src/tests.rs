@@ -761,6 +761,8 @@ fn imports_hand_written_fixture() {
     assert_eq!(gradient.kind, designcraft_color::GradientKind::Radial);
     assert_eq!(gradient.stops[1].color, Color::cmyk(0.1, 0.2, 0.3, 0.4));
     assert!((gradient.stops[0].midpoint - 0.3).abs() < 1e-6);
+    assert_eq!(gradient.stops[0].swatch.as_deref(), Some("Brand"), "a stop on a swatch keeps it");
+    assert_eq!(gradient.stops[1].swatch, None, "an unnamed color stays plain");
     // The parent rectangle used an unnamed colour → value-named swatch.
     let mr = &d.parents[0].items[0];
     assert_eq!(mr.fill.swatch, "C=10 M=20 Y=30 K=40");
@@ -1040,6 +1042,29 @@ fn round_trips_small_document() {
     assert_eq!(oval.fill.swatch, "Brand 30");
     assert!((oval.opacity - 0.5).abs() < 1e-6);
     assert!(back.swatch("Brand 30").is_some());
+}
+
+#[test]
+fn gradient_stops_keep_their_swatches_through_a_round_trip() {
+    use designcraft_color::{ColorType, Gradient, GradientKind, GradientStop};
+    let mut d = Document::new(&NewDocument::default());
+    let gold = Color::cmyk(0.0, 0.3, 0.9, 0.1);
+    d.swatches.push(Swatch { value: SwatchValue::Color { color: gold, color_type: ColorType::Spot }, ..Swatch::color("Gold", gold) });
+    d.swatches.push(Swatch { value: SwatchValue::Tint { base: "Gold".into(), tint: 0.4 }, ..Swatch::color("Gold 40%", gold) });
+    let on = |offset: f32, name: &str| GradientStop {
+        swatch: Some(name.into()),
+        ..GradientStop::new(offset, designcraft_color::swatch::resolve(&d.swatches, name, 1.0).unwrap())
+    };
+    let stops = vec![on(0.0, "Gold"), on(0.3, "Gold 40%"), GradientStop::new(0.6, Color::cmyk(0.5, 0.0, 0.0, 0.0)), on(1.0, "[Paper]")];
+    d.swatches.push(Swatch {
+        value: SwatchValue::Gradient { gradient: Gradient { kind: GradientKind::Linear, stops } },
+        ..Swatch::color("Gold fade", gold)
+    });
+    let back = import_idml(&export_idml(&d)).unwrap();
+    let SwatchValue::Gradient { gradient } = &back.swatch("Gold fade").unwrap().value else { panic!("gradient") };
+    let names: Vec<Option<&str>> = gradient.stops.iter().map(|s| s.swatch.as_deref()).collect();
+    assert_eq!(names, [Some("Gold"), Some("Gold 40%"), None, Some("[Paper]")]);
+    assert_eq!(gradient.stops[2].color, Color::cmyk(0.5, 0.0, 0.0, 0.0));
 }
 
 #[test]
@@ -4507,6 +4532,7 @@ fn exports_graphic_in_table_cell() {
     });
     let mut t = designcraft_doc::Table::new(d.alloc(), 2, 2, 0, 0, 200.0);
     t.cell_mut(1, 0).unwrap().graphic = Some(designcraft_doc::Graphic {
+        layer_options: None,
         asset: id,
         size: (24.0, 24.0),
         xf: designcraft_geom::Affine::IDENTITY,
@@ -4629,5 +4655,59 @@ fn style_names_with_a_literal_colon_survive_a_round_trip() {
     assert_eq!(names::style_name_out(names::PARA_BUILTINS, "Group/Child"), "Group:Child");
     for n in names {
         assert_eq!(names::style_name_in(names::PARA_BUILTINS, &names::style_name_out(names::PARA_BUILTINS, n)), n);
+    }
+}
+
+/// Split Document (EPUB only) comes from the style, or from its EPUB export tag map, and is
+/// written back on the style.
+#[test]
+fn split_document_round_trips() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<idPkg:Styles xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="16.0">
+  <RootParagraphStyleGroup Self="rp">
+    <ParagraphStyle Self="ParagraphStyle/$ID/[No paragraph style]" Name="$ID/[No paragraph style]" PointSize="12" SplitDocument="false"/>
+    <ParagraphStyle Self="ParagraphStyle/Part" Name="Part" SplitDocument="true"/>
+    <ParagraphStyle Self="ParagraphStyle/Chapter" Name="Chapter" SplitDocument="false">
+      <StyleExportTagMap Self="uaStyleExportTagMapnEPUB" ExportType="EPUB" ExportTag="h1" ExportClass="" ExportAttributes="" SplitDocument="true" EmitCss="true"/>
+    </ParagraphStyle>
+    <ParagraphStyle Self="ParagraphStyle/Body" Name="Body" SplitDocument="false"/>
+  </RootParagraphStyleGroup>
+</idPkg:Styles>"#;
+    let d = import_idml_with(&fixture_with_styles(xml), &|_| None).unwrap();
+    let split = |d: &designcraft_doc::Document, name: &str| d.styles.export_tag(name, false).is_some_and(|t| t.split);
+    assert!(split(&d, "Part") && split(&d, "Chapter") && !split(&d, "Body"));
+    let back = import_idml(&export_idml(&d)).unwrap();
+    assert!(split(&back, "Part") && split(&back, "Chapter") && !split(&back, "Body"));
+}
+
+/// EPUB Export Options › Split Document: off, one style (built in or not) or the styles' export
+/// tags, read from the file's `EPubExportPreference` and written back.
+#[test]
+fn epub_split_document_round_trips() {
+    use designcraft_doc::EpubSplit;
+    let styles =
+        STYLES.replace("</RootParagraphStyleGroup>", r#"<ParagraphStyle Self="ParagraphStyle/Chapter" Name="Chapter"/></RootParagraphStyleGroup>"#);
+    assert!(styles.contains("ParagraphStyle/Chapter"), "the fixture has a paragraph style group");
+    for (attrs, want) in [
+        (r#"BreakDocument="false" ParagraphStyleName="ParagraphStyle/Chapter""#, EpubSplit::Off),
+        (r#"BreakDocument="true" ParagraphStyleName="ParagraphStyle/Chapter""#, EpubSplit::Style("Chapter".into())),
+        (r#"BreakDocument="true" ParagraphStyleName="ParagraphStyle/Text%3aBody""#, EpubSplit::Style("Text/Body".into())),
+        (r#"BreakDocument="true" ParagraphStyleName="$ID/NormalParagraphStyle""#, EpubSplit::Style(designcraft_doc::BASIC_PARAGRAPH.into())),
+        (r#"BreakDocument="true" ParagraphStyleName="""#, EpubSplit::ExportTags),
+        (r#"BreakDocument="true" ParagraphStyleName="ParagraphStyle/Missing""#, EpubSplit::Off),
+    ] {
+        let prefs = PREFS.replace("</idPkg:Preferences>", &format!("<EPubExportPreference {attrs}/></idPkg:Preferences>"));
+        let file = zip_files(&[
+            ("designmap.xml", DESIGNMAP),
+            ("Resources/Graphic.xml", GRAPHIC),
+            ("Resources/Styles.xml", &styles),
+            ("Resources/Preferences.xml", &prefs),
+            ("MasterSpreads/MasterSpread_m1.xml", MASTER),
+            ("Spreads/Spread_sp1.xml", SPREAD),
+            ("Stories/Story_s1.xml", STORY),
+        ]);
+        let d = import_idml_with(&file, &|_| None).unwrap();
+        assert_eq!(d.settings.epub_split, want, "{attrs}");
+        assert_eq!(import_idml(&export_idml(&d)).unwrap().settings.epub_split, want, "{attrs}");
     }
 }

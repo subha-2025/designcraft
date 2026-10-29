@@ -20,6 +20,7 @@ pub mod math;
 pub mod recovery;
 pub mod sample;
 pub mod script;
+pub mod separations;
 mod tooling;
 
 use std::sync::Arc;
@@ -33,7 +34,7 @@ pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
 pub use designcraft_compose as compose;
 pub use designcraft_doc as doc;
 pub use designcraft_tools as tools;
-pub use tooling::{SnapView, UiRequest, ViewInfo};
+pub use tooling::{ImeMutation, ImeTextContext, SnapView, UiRequest, ViewInfo, ime_delete_ranges};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -101,6 +102,9 @@ pub struct DocState {
     /// Editing parent spreads (Pages panel double-click on a parent).
     pub editing_parents: bool,
     pub uid: u64,
+    /// Changes whenever this document state is recreated, even if [`Self::uid`] is preserved
+    /// (File › Revert keeps the uid for recovery but replaces the document).
+    pub identity_epoch: u64,
     /// Recovery entries this state actually opened or published, for repeated-open and cleanup.
     /// Bounded, deduplicated checkpoint addresses; never inferred from uid alone.
     pub(crate) recovery_entries: Vec<(std::path::PathBuf, u64)>,
@@ -141,10 +145,12 @@ fn next_revision() -> u64 {
 }
 
 impl DocState {
+    /// Initialize saved/live document identity, revision, epoch, active default layer, empty history with limit 1,000 and the initial path.
     pub fn new(doc: Document, path: Option<String>) -> Self {
         let active_layer = doc.default_layer();
         let doc = Arc::new(doc);
         let revision = next_revision();
+        let identity_epoch = NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         DocState {
             saved_doc: doc.clone(),
             doc,
@@ -156,7 +162,8 @@ impl DocState {
             active_layer,
             interaction: None,
             editing_parents: false,
-            uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            uid: identity_epoch,
+            identity_epoch,
             recovery_entries: Vec::new(),
             preview_stash: None,
             preview_record: None,
@@ -756,19 +763,3 @@ pub(crate) use push_undo as record_undo;
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod tests_autosize;
-#[cfg(test)]
-mod tests_file_guard;
-#[cfg(test)]
-mod tests_idml;
-#[cfg(test)]
-mod tests_ime;
-#[cfg(test)]
-mod tests_linked_paths;
-#[cfg(test)]
-mod tests_params;
-#[cfg(test)]
-mod tests_roots;
-#[cfg(test)]
-mod tests_table;

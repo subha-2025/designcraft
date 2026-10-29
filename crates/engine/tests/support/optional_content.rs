@@ -115,6 +115,7 @@ pub fn document(bytes: Vec<u8>, hidden_sets: &[&[&str]]) -> Document {
             crop: [0.0; 4],
             wrap: Default::default(),
             fill: Default::default(),
+            layer_options: None,
         });
         doc.insert_item(SpreadRef::Doc(0), item, None).unwrap();
     }

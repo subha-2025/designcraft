@@ -662,6 +662,51 @@ fn wrap_obstacles(it: &Item, parent: Affine, inv: Affine, skip: ItemId, left_pag
     }
 }
 
+/// Adds to `exclusions` the objects on `sp` that wrap the text of frame `item`. Only objects that
+/// reach the frame's text area wrap its text: one elsewhere on the spread would otherwise cost a
+/// narrow column its room (the 1.5 em minimum segment of `free_slots` applies once an object cuts
+/// the column).
+fn frame_wrap_exclusions(doc: &Document, sp: &designcraft_doc::Spread, item: &Item, inv: Affine, exclusions: &mut Vec<Exclusion>) {
+    let left = |x: f64| sp.page_at_x(x).and_then(|pi| sp.pages.get(pi)).is_some_and(|p| p.side == designcraft_doc::PageSide::Left);
+    for other in &sp.items {
+        if doc.layer(other.layer).is_some_and(|l| !l.visible) {
+            continue;
+        }
+        wrap_obstacles(other, Affine::IDENTITY, inv, item.id, &left, 0, exclusions);
+    }
+    let a = item.text_area();
+    exclusions.retain(|e| {
+        let r = e.rect;
+        r.is_finite() && r.x0 < a.x1 && r.x1 > a.x0 && r.y0 < a.y1 && r.y1 > a.y0
+    });
+}
+
+/// The text area and options a frame composes into. On a path, one line as long as the path (from
+/// the start offset).
+fn frame_text_area(doc: &Document, st: &Story, item: &Item, tf: &designcraft_doc::TextFrame) -> (Rect, TextFrameOptions) {
+    match &tf.options.path {
+        Some(pt) => {
+            let len = designcraft_geom::warp::PathWarp::new(&item.path.to_bezpath(), false).length();
+            let size = st
+                .paras
+                .first()
+                .map(|p| doc.styles.resolve_para(p).1)
+                .map(|base| st.runs().map(|(_, f)| doc.styles.resolve_char(&base, f).size).fold(base.size, f64::max))
+                .unwrap_or(12.0);
+            let opts = TextFrameOptions {
+                columns: 1,
+                inset: [0.0; 4],
+                first_baseline: designcraft_doc::FirstBaseline::Ascent,
+                // Keep the path identity: its synthetic area uses full line extents.
+                ..tf.options.clone()
+            };
+            let end = pt.end.map_or(len, |e| e.max(0.0).min(len));
+            (Rect::new(0.0, 0.0, (end - pt.start).max(1.0), size * 1.6), opts)
+        }
+        None => (item.text_area(), tf.options.clone()),
+    }
+}
+
 /// Build the frame specs of a story from the document (geometry, wrap, page names, grid).
 pub fn frame_specs(doc: &Document, sid: StoryId) -> Vec<FrameSpec> {
     frame_specs_placed(doc, sid, &[])
@@ -694,21 +739,7 @@ pub(crate) fn frame_specs_placed(doc: &Document, sid: StoryId, placed: &[(ItemId
             && loc.is_some()
             && let Some(sp) = spread
         {
-            let left = |x: f64| sp.page_at_x(x).and_then(|pi| sp.pages.get(pi)).is_some_and(|p| p.side == designcraft_doc::PageSide::Left);
-            for other in &sp.items {
-                if doc.layer(other.layer).is_some_and(|l| !l.visible) {
-                    continue;
-                }
-                wrap_obstacles(other, Affine::IDENTITY, inv, item.id, &left, 0, &mut exclusions);
-            }
-            // Only objects that reach the frame's text area wrap its text: one elsewhere on the
-            // spread would otherwise cost a narrow column its room (the 1.5 em minimum segment of
-            // `free_slots` applies once an object cuts the column).
-            let a = item.text_area();
-            exclusions.retain(|e| {
-                let r = e.rect;
-                r.is_finite() && r.x0 < a.x1 && r.x1 > a.x0 && r.y0 < a.y1 && r.y1 > a.y0
-            });
+            frame_wrap_exclusions(doc, sp, item, inv, &mut exclusions);
         }
         let (page_name, page, side) = match (spread_ref, spread) {
             (Some(designcraft_doc::SpreadRef::Doc(si)), Some(sp)) => {
@@ -750,27 +781,7 @@ pub(crate) fn frame_specs_placed(doc: &Document, sid: StoryId, placed: &[(ItemId
         };
         let grid = (inc > 0.0 && inc.is_finite() && start.is_finite()).then_some((start - ty, inc));
         // Type on a path: one line as long as the path (from the start offset).
-        let (area, opts) = match &tf.options.path {
-            Some(pt) => {
-                let len = designcraft_geom::warp::PathWarp::new(&item.path.to_bezpath(), false).length();
-                let size = st
-                    .paras
-                    .first()
-                    .map(|p| doc.styles.resolve_para(p).1)
-                    .map(|base| st.runs().map(|(_, f)| doc.styles.resolve_char(&base, f).size).fold(base.size, f64::max))
-                    .unwrap_or(12.0);
-                let opts = TextFrameOptions {
-                    columns: 1,
-                    inset: [0.0; 4],
-                    first_baseline: designcraft_doc::FirstBaseline::Ascent,
-                    // Keep the path identity: its synthetic area uses full line extents.
-                    ..tf.options.clone()
-                };
-                let end = pt.end.map_or(len, |e| e.max(0.0).min(len));
-                (Rect::new(0.0, 0.0, (end - pt.start).max(1.0), size * 1.6), opts)
-            }
-            None => (item.text_area(), tf.options.clone()),
-        };
+        let (area, opts) = frame_text_area(doc, st, item, tf);
         // A non-rectangular frame keeps the top inset inward from its outline; its rectangular text
         // area (all four insets) still bounds the lines.
         let outline = match &tf.options.path {

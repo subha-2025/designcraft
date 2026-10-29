@@ -65,9 +65,10 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!("note.delete", "Delete Note", ["Type", "Notes"], None, "{story, id}", has_doc, |s, p| {
             let (sid, id) = target(p)?;
-            s.edit(|d, _| {
+            s.edit(|d, sel| {
                 let st = d.story_mut(sid).ok_or_else(|| bad("note.delete", "no such story"))?;
                 let at = anchor(st, id).ok_or_else(|| bad("note.delete", format!("no note {id}")))?;
+                follow_replace(sel, sid, at..at + NOTE_MARK.len_utf8(), 0);
                 st.delete(at..at + NOTE_MARK.len_utf8());
                 ok()
             })
@@ -81,14 +82,24 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             |s, p| {
                 let (sid, id) = target(p)?;
-                s.edit(|d, _| {
+                s.edit(|d, sel| {
                     let st = d.story_mut(sid).ok_or_else(|| bad("note.convertToText", "no such story"))?;
                     let at = anchor(st, id).ok_or_else(|| bad("note.convertToText", format!("no note {id}")))?;
                     let text = st.editorial.iter().find(|n| n.id == id).map(|n| n.text.clone()).unwrap_or_default();
+                    follow_replace(sel, sid, at..at + NOTE_MARK.len_utf8(), text.len());
                     st.replace(at..at + NOTE_MARK.len_utf8(), &text);
                     ok()
                 })
             }
+        ),
+        cmd!(
+            "note.split",
+            "Split Note",
+            ["Type", "Notes"],
+            None,
+            "{story, id, at} → {story, id}. The note's text from byte `at` on moves into a new note anchored right after it.",
+            has_doc,
+            split
         ),
         cmd!(query "note.list", "Notes", [], None, "{} → [{story, id, at, author, text}] in story order", has_doc, |s, _| {
             let d = &s.doc()?.doc;
@@ -172,6 +183,42 @@ fn convert_from_text(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+/// Split Note (the Notes panel's Split Note button): the text after the split point leaves the note
+/// and becomes the text of a new note by the same author, whose anchor directly follows the note's anchor.
+fn split(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "note.split";
+    let (sid, id) = target(p)?;
+    let at = p.get("at").and_then(Value::as_u64).ok_or_else(|| bad(ID, "`at` required"))?;
+    s.edit(|d, sel| {
+        let story = d.story_mut(sid).ok_or_else(|| bad(ID, "no such story"))?;
+        let pos = anchor(story, id).ok_or_else(|| bad(ID, format!("no note {id}")))?;
+        let note = story.editorial.iter().find(|n| n.id == id).cloned().ok_or_else(|| bad(ID, format!("no note {id}")))?;
+        let at = usize::try_from(at).ok().filter(|&a| a > 0 && a < note.text.len() && note.text.is_char_boundary(a));
+        let at = at.ok_or_else(|| bad(ID, "place the split point inside the note's text"))?;
+        let (head, tail) = note.text.split_at(at);
+        let (head, tail) = (head.to_string(), tail.to_string());
+        let ins = pos + NOTE_MARK.len_utf8();
+        let fmt = story.char_format_at(pos).clone();
+        story.insert_with(ins, &NOTE_MARK.to_string(), fmt);
+        story.fix_marks();
+        let k = story.text[..ins].matches(NOTE_MARK).count();
+        let first = story.editorial.get_mut(k - 1).ok_or_else(|| bad(ID, "the story's notes don't match their anchors"))?;
+        Arc::make_mut(first).text = head;
+        let n = story.editorial.get_mut(k).ok_or_else(|| bad(ID, "the story's notes don't match their anchors"))?;
+        let n = Arc::make_mut(n);
+        (n.text, n.author) = (tail, note.author.clone());
+        let new = n.id;
+        if let Some(t) = sel.text.as_mut().filter(|t| t.story == sid && t.cell.is_none()) {
+            for c in [&mut t.anchor, &mut t.focus] {
+                if *c >= ins {
+                    *c += NOTE_MARK.len_utf8();
+                }
+            }
+        }
+        Ok(json!({"story": sid.0, "id": new}))
+    })
+}
+
 fn target(p: &Value) -> Result<(StoryId, u64)> {
     let sid = p.get("story").and_then(Value::as_u64).ok_or_else(|| bad("note", "`story` required"))?;
     let id = p.get("id").and_then(Value::as_u64).ok_or_else(|| bad("note", "`id` required"))?;
@@ -182,6 +229,16 @@ fn target(p: &Value) -> Result<(StoryId, u64)> {
 fn anchor(st: &designcraft_doc::Story, id: u64) -> Option<usize> {
     let k = st.editorial.iter().position(|n: &Arc<EditorialNote>| n.id == id)?;
     st.text.match_indices(NOTE_MARK).nth(k).map(|(i, _)| i)
+}
+
+/// Keeps a caret or selection in story `sid`'s own text (not a cell) on the same characters when `range` is replaced
+/// by `len` bytes: an end after the range moves by the change in length, and an end inside it moves to its start.
+fn follow_replace(sel: &mut designcraft_doc::Selection, sid: StoryId, range: std::ops::Range<usize>, len: usize) {
+    if let Some(t) = sel.text.as_mut().filter(|t| t.story == sid && t.cell.is_none()) {
+        let follow = |i: usize| if i >= range.end { i - range.len() + len } else { i.min(range.start) };
+        t.anchor = follow(t.anchor);
+        t.focus = follow(t.focus);
+    }
 }
 
 /// The anchor offset and id of the note before or after the selection `t` in its story. Going
@@ -355,6 +412,48 @@ mod tests {
     }
 
     #[test]
+    fn split_note_moves_the_text_after_the_split_point_into_a_new_note() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Draft copy."})).unwrap();
+        let sid = designcraft_doc::StoryId(r["story"].as_u64().unwrap());
+        let mark = designcraft_doc::NOTE_MARK.len_utf8();
+        s.execute("text.select", &json!({"story": r["story"], "anchor": 5, "focus": 5})).unwrap();
+        let n = s.execute("note.new", &json!({"text": "check this", "author": "Ed"})).unwrap();
+        s.execute("text.select", &json!({"story": r["story"], "anchor": 9 + mark, "focus": 9 + mark})).unwrap();
+        let later = s.execute("note.new", &json!({"text": "later"})).unwrap();
+        // The caret sits after "Draft" and its anchor, before " copy".
+        s.execute("text.select", &json!({"story": r["story"], "anchor": 5 + mark, "focus": 5 + mark})).unwrap();
+        let before = s.doc().unwrap().doc.stories[&sid].clone();
+        let split = |s: &mut Session, at: u64| s.execute("note.split", &json!({"story": n["story"], "id": n["id"], "at": at}));
+        for at in [0, 10, 11, 99] {
+            assert!(matches!(split(&mut s, at), Err(crate::EngineError::BadParams { .. })), "split point {at}");
+        }
+        assert_eq!(s.doc().unwrap().doc.stories[&sid], before);
+        let m = split(&mut s, 6).unwrap();
+        let st = &s.doc().unwrap().doc.stories[&sid];
+        st.check().unwrap();
+        assert_eq!(st.text, format!("Draft{m}{m} cop{m}y.", m = designcraft_doc::NOTE_MARK));
+        let list = s.execute("note.list", &json!({})).unwrap();
+        let row = |k: usize| (list[k]["id"].clone(), list[k]["at"].clone(), list[k]["text"].clone(), list[k]["author"].clone());
+        assert_eq!(row(0), (n["id"].clone(), json!(5), json!("check "), json!("Ed")));
+        assert_eq!(row(1), (m["id"].clone(), json!(5 + mark), json!("this"), json!("Ed")), "the new note follows the first");
+        assert_eq!(row(2).0, later["id"], "the later note keeps its text");
+        assert_eq!(list[2]["text"], "later");
+        let caret = s.doc().unwrap().selection.text.map(|t| (t.anchor, t.focus));
+        assert_eq!(caret, Some((5 + 2 * mark, 5 + 2 * mark)), "the caret stays before \" copy\"");
+        // Multibyte text splits on character boundaries only.
+        let e = s.execute("note.new", &json!({"text": "été"})).unwrap();
+        let refused = s.execute("note.split", &json!({"story": e["story"], "id": e["id"], "at": 1}));
+        assert!(matches!(refused, Err(crate::EngineError::BadParams { .. })), "inside a character");
+        s.execute("note.split", &json!({"story": e["story"], "id": e["id"], "at": 2})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.stories[&sid], before, "undo restores the one note");
+    }
+
+    #[test]
     fn convert_to_note_needs_selected_story_text_without_objects() {
         let mut s = Session::new();
         s.execute("file.new", &json!({})).unwrap();
@@ -376,5 +475,33 @@ mod tests {
         s.execute("text.move", &json!({"dir": "left", "extend": true})).unwrap();
         assert!(s.doc().unwrap().selection.text.is_some_and(|t| t.cell.is_some() && !t.is_caret()));
         assert!(disabled(s.execute("note.convertFromText", &json!({}))), "notes go in story text");
+    }
+
+    #[test]
+    fn deleting_or_converting_a_note_keeps_the_caret_on_its_character() {
+        let m = designcraft_doc::NOTE_MARK.len_utf8();
+        // (anchor, focus) in "Draft{note} copy." before the command, then (anchor, focus) and the selected text after
+        // Delete Note and after Convert Note to Text with the note's text "ab".
+        let cases = [
+            ((6 + m, 10 + m), ((6, 10), "copy"), ((8, 12), "copy")),
+            ((0, 10 + m), ((0, 10), "Draft copy"), ((0, 12), "Draftab copy")),
+            ((2, 4), ((2, 4), "af"), ((2, 4), "af")),
+            ((5 + m, 5 + m), ((5, 5), ""), ((7, 7), "")),
+        ];
+        for (before, deleted, converted) in cases {
+            for (cmd, (after, selected)) in [("note.delete", deleted), ("note.convertToText", converted)] {
+                let mut s = Session::new();
+                s.execute("file.new", &json!({})).unwrap();
+                let r = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Draft copy."})).unwrap();
+                let sid = designcraft_doc::StoryId(r["story"].as_u64().unwrap());
+                s.execute("text.select", &json!({"story": r["story"], "anchor": 5, "focus": 5})).unwrap();
+                let n = s.execute("note.new", &json!({"text": "ab"})).unwrap();
+                s.execute("text.select", &json!({"story": r["story"], "anchor": before.0, "focus": before.1})).unwrap();
+                s.execute(cmd, &json!({"story": n["story"], "id": n["id"]})).unwrap();
+                let t = s.doc().unwrap().selection.text.unwrap();
+                assert_eq!((t.anchor, t.focus), after, "{cmd} with {before:?} selected");
+                assert_eq!(&s.doc().unwrap().doc.stories[&sid].text[t.anchor..t.focus], selected, "{cmd} with {before:?} selected");
+            }
+        }
     }
 }

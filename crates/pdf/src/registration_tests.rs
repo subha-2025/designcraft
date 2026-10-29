@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Affine, Arc, AssetId, BookletOptions, Cache, Content, Document, Item, PdfOptions, Rect, SpreadRef, Standard, export_booklet, export_pdf,
+    merge_pdfs,
+};
 
 fn placed_document(source: Vec<u8>) -> Document {
     use designcraft_doc::{Asset, Graphic, ItemId, Shape};
@@ -17,6 +20,7 @@ fn placed_document(source: Vec<u8>) -> Document {
         crop: [0.0; 4],
         wrap: Default::default(),
         fill: Default::default(),
+        layer_options: None,
     });
     doc.insert_item(SpreadRef::Doc(0), item, None).unwrap();
     doc

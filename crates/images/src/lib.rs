@@ -75,6 +75,7 @@ pub fn mime(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// Initialize the process-wide usvg database from the bundled and Japanese fonts, with case-aware family/PostScript resolution, fallback selection and preflighted SVG data URLs; file-backed image URLs are never read.
 fn svg_options() -> &'static usvg::Options<'static> {
     static OPTS: OnceLock<usvg::Options<'static>> = OnceLock::new();
     OPTS.get_or_init(|| {
@@ -92,8 +93,23 @@ fn svg_options() -> &'static usvg::Options<'static> {
         let font_resolver = usvg::FontResolver { select_font: select_font(), select_fallback: select_fallback() };
         // Images inside an SVG come only from `data:` URLs: an `href` naming a file is not read
         // (it is left out, as usvg leaves out an image it can't load).
-        let image_href_resolver =
-            usvg::ImageHrefResolver { resolve_data: usvg::ImageHrefResolver::default_data_resolver(), resolve_string: Box::new(|_, _| None) };
+        let default_data = usvg::ImageHrefResolver::default_data_resolver();
+        let image_href_resolver = usvg::ImageHrefResolver {
+            resolve_data: Box::new(move |mime, data, options| {
+                let raster = matches!(
+                    image::guess_format(&data),
+                    Ok(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Gif | image::ImageFormat::WebP)
+                );
+                if mime == "image/svg+xml" || (mime == "text/plain" && !raster) {
+                    let xml = svg_data(&data)?;
+                    svg_preflight(&xml)?;
+                    default_data(mime, Arc::new(xml.into_owned()), options)
+                } else {
+                    default_data(mime, data, options)
+                }
+            }),
+            resolve_string: Box::new(|_, _| None),
+        };
         usvg::Options { fontdb: Arc::new(db), font_family: "Source Sans 3".into(), font_resolver, image_href_resolver, ..Default::default() }
     })
 }
@@ -222,9 +238,71 @@ fn add_face(db: &mut Arc<usvg::fontdb::Database>, face: Arc<designcraft_fonts::F
     ids.into_iter().find(|id| db.face(*id).is_some_and(|f| f.index == index))
 }
 
-/// The parsed SVG.
+/// Limits apply before usvg's recursive XML/SVG parsing, including SVGZ output.
+/// Ordinary SVG doctypes are accepted; internal DTD subsets are not, since entity
+/// expansion could introduce markup that the streaming depth check never sees.
+const MAX_SVG_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SVG_EVENTS: usize = 100_000;
+const MAX_SVG_DEPTH: usize = 64;
+
+/// Enforce the encoded-size cap, gunzip SVGZ data with that bound, and return the decoded content within the cap as an owned or borrowed `Cow`.
+fn svg_data(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use std::io::Read;
+
+    if bytes.len() > MAX_SVG_BYTES {
+        return None;
+    }
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut xml = Vec::new();
+        flate2::read::GzDecoder::new(bytes).take(MAX_SVG_BYTES as u64 + 1).read_to_end(&mut xml).ok()?;
+        (xml.len() <= MAX_SVG_BYTES).then_some(std::borrow::Cow::Owned(xml))
+    } else {
+        Some(std::borrow::Cow::Borrowed(bytes))
+    }
+}
+
+/// Require UTF-8, bounded XML events, balanced tags and depth at most 64; reject internal DTD subsets while accepting ordinary external doctypes.
+fn svg_preflight(bytes: &[u8]) -> Option<()> {
+    use quick_xml::events::Event;
+
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut reader = quick_xml::Reader::from_str(text);
+    let mut depth = 0usize;
+    for _ in 0..MAX_SVG_EVENTS {
+        match reader.read_event().ok()? {
+            Event::Start(_) => {
+                depth += 1;
+                if depth > MAX_SVG_DEPTH {
+                    return None;
+                }
+            }
+            Event::Empty(_) if depth >= MAX_SVG_DEPTH => return None,
+            Event::End(_) => depth = depth.checked_sub(1)?,
+            Event::DocType(doctype) => {
+                // A '[' inside a quoted external identifier is not an internal subset.
+                let mut quote = None;
+                for &byte in doctype.as_ref() {
+                    match (quote, byte) {
+                        (Some(q), b) if b == q => quote = None,
+                        (None, b'\'' | b'"') => quote = Some(byte),
+                        (None, b'[') => return None,
+                        _ => {}
+                    }
+                }
+            }
+            Event::Eof => return (depth == 0).then_some(()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse an SVG with at most 16 MiB encoded/decoded data, 100,000 XML events and
+/// 64 nested elements. Reject internal DTD subsets before recursive conversion.
 pub fn svg_tree(bytes: &[u8]) -> Option<usvg::Tree> {
-    usvg::Tree::from_data(bytes, svg_options()).ok()
+    let xml = svg_data(bytes)?;
+    svg_preflight(&xml)?;
+    usvg::Tree::from_data(&xml, svg_options()).ok()
 }
 
 /// A WMF replayed as SVG: a vector drawing with a transparent background. `None` when the file is

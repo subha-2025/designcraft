@@ -127,7 +127,10 @@ impl Unit {
         // Choose a major spacing (base × 1, 2, 5, 10…) at least ~60 px apart, or base / 2^n when zoomed in.
         let mut major = base;
         while major * zoom < 50.0 {
-            major *= if (major / base).log10().fract().abs() < 1e-9 { 2.0 } else { 2.5 };
+            let ratio = major / base;
+            let mantissa = ratio / 10f64.powf(ratio.log10().floor());
+            // 1 -> 2 -> 5 -> 10: double at mantissa 1 or 5, ×2.5 at mantissa 2.
+            major *= if (mantissa - 2.0).abs() < 1e-6 { 2.5 } else { 2.0 };
         }
         while major * zoom > 160.0 && major > base / 64.0 {
             major /= 2.0;
@@ -298,6 +301,12 @@ pub fn format_measure_prec(pt: f64, unit: Unit, decimals: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ruler_major_spacing_steps_1_2_5_10() {
+        assert!(close(Unit::Points.ruler_ticks(0.1).0, 720.0));
+        assert!(close(Unit::Points.ruler_ticks(0.01).0, 7200.0));
+    }
 
     fn p(s: &str) -> f64 {
         parse_measure(s, Unit::Points).unwrap()

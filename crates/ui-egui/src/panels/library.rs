@@ -173,7 +173,7 @@ pub fn book(app: &mut DesignApp, ui: &mut egui::Ui) {
 /// Scripts panel: saved command scripts — run (one undo step), edit, add, delete, load.
 pub fn scripts(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
-    let sel_id = egui::Id::new("scripts_sel");
+    let sel_id = egui::Id::unique("scripts_sel");
     let mut sel: usize = ui.data(|d| d.get_temp(sel_id)).unwrap_or(0);
     if app.ui.scripts.is_empty() {
         crate::rtl::label(
